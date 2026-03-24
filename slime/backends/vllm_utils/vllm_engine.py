@@ -1,4 +1,4 @@
-"""VLLMEngine: Ray actor that launches and manages a vLLM server + translation sidecar."""
+"""VLLMEngine: Ray actor that launches and manages a vLLM server + rollout adapter."""
 
 import logging
 import multiprocessing
@@ -26,17 +26,17 @@ class VLLMEngine(RayActor):
         self.gpu_ids = gpu_ids or [self.base_gpu_id]
         self.server_host = None
         self.server_port = None
-        self.sidecar_port = None
+        self.adapter_port = None
         self.process = None
-        self.sidecar_process = None
+        self.adapter_process = None
         self._log_file = None
-        self._sidecar_log_file = None
+        self._adapter_log_file = None
         self._weight_version: int = 0
 
     @property
-    def sidecar_url(self) -> str:
-        """URL of the translation sidecar (registered with the router)."""
-        return f"http://{self.server_host}:{self.sidecar_port}"
+    def adapter_url(self) -> str:
+        """URL of the vLLM rollout adapter (registered with the router)."""
+        return f"http://{self.server_host}:{self.adapter_port}"
 
     @property
     def vllm_url(self) -> str:
@@ -46,7 +46,7 @@ class VLLMEngine(RayActor):
     def init(self, port=None, host=None, router_ip=None, router_port=None, **kwargs):
         self.server_host = host or get_host_info()[1]
         self.server_port = port or get_free_port(15000)
-        self.sidecar_port = get_free_port(self.server_port + 100)
+        self.adapter_port = get_free_port(self.server_port + 100)
         self.router_ip = router_ip or getattr(self.args, "sglang_router_ip", None)
         self.router_port = router_port or getattr(self.args, "sglang_router_port", None)
 
@@ -101,11 +101,11 @@ class VLLMEngine(RayActor):
         )
         self._wait_healthy()
 
-        # Launch the translation sidecar
-        self._launch_sidecar()
-        self._wait_sidecar_healthy()
+        # Launch the rollout adapter
+        self._launch_adapter()
+        self._wait_adapter_healthy()
 
-        # Register the sidecar URL with the router
+        # Register the adapter URL with the router
         if self.router_ip and self.router_port:
             self._register_with_router()
 
@@ -127,77 +127,77 @@ class VLLMEngine(RayActor):
         log_tail = self._read_log_tail()
         raise TimeoutError(f"vLLM server failed to become healthy within {timeout}s.\n{log_tail}")
 
-    def _launch_sidecar(self):
-        """Launch the translation sidecar as a subprocess."""
-        from slime.backends.vllm_utils.vllm_translation_sidecar import run_sidecar
+    def _launch_adapter(self):
+        """Launch the vLLM rollout adapter as a subprocess."""
+        from slime.backends.vllm_utils.vllm_rollout_adapter import run_vllm_rollout_adapter
 
-        self._sidecar_log_file = tempfile.NamedTemporaryFile(
-            prefix="vllm_sidecar_", suffix=".log", delete=False, mode="w"
+        self._adapter_log_file = tempfile.NamedTemporaryFile(
+            prefix="vllm_adapter_", suffix=".log", delete=False, mode="w"
         )
 
         def _target():
-            run_sidecar(
+            run_vllm_rollout_adapter(
                 vllm_host="127.0.0.1",
                 vllm_port=self.server_port,
-                sidecar_host="0.0.0.0",
-                sidecar_port=self.sidecar_port,
+                adapter_host="0.0.0.0",
+                adapter_port=self.adapter_port,
                 model_name=self._model_name,
                 log_level="info",
             )
 
-        self.sidecar_process = multiprocessing.Process(target=_target, daemon=True)
-        self.sidecar_process.start()
+        self.adapter_process = multiprocessing.Process(target=_target, daemon=True)
+        self.adapter_process.start()
         logger.info(
-            "Launched translation sidecar on port %s (vLLM → %s:%s), log=%s",
-            self.sidecar_port,
+            "Launched vLLM rollout adapter on port %s (vLLM → %s:%s), log=%s",
+            self.adapter_port,
             self.server_host,
             self.server_port,
-            self._sidecar_log_file.name,
+            self._adapter_log_file.name,
         )
 
-    def _wait_sidecar_healthy(self, timeout: float = 60.0):
-        """Block until the sidecar /health endpoint responds 200."""
-        url = f"{self.sidecar_url}/health"
+    def _wait_adapter_healthy(self, timeout: float = 60.0):
+        """Block until the adapter /health endpoint responds 200."""
+        url = f"{self.adapter_url}/health"
         start = time.time()
         while time.time() - start < timeout:
             try:
                 r = requests.get(url, timeout=5)
                 if r.status_code == 200:
-                    logger.info("Translation sidecar healthy at %s", self.sidecar_url)
+                    logger.info("vLLM rollout adapter healthy at %s", self.adapter_url)
                     return
             except Exception:
                 pass
-            if self.sidecar_process and not self.sidecar_process.is_alive():
+            if self.adapter_process and not self.adapter_process.is_alive():
                 raise RuntimeError(
-                    f"Sidecar process exited with code {self.sidecar_process.exitcode}"
+                    f"Adapter process exited with code {self.adapter_process.exitcode}"
                 )
             time.sleep(1)
-        raise TimeoutError(f"Sidecar failed to become healthy within {timeout}s")
+        raise TimeoutError(f"Adapter failed to become healthy within {timeout}s")
 
     def _register_with_router(self):
-        """Register the sidecar URL with the SlimeRouter."""
+        """Register the adapter URL with the SlimeRouter."""
         router_url = f"http://{self.router_ip}:{self.router_port}"
         response = requests.post(
             f"{router_url}/add_worker",
-            params={"url": self.sidecar_url},
+            params={"url": self.adapter_url},
         )
         response.raise_for_status()
         logger.info(
-            "Registered sidecar %s with router at %s",
-            self.sidecar_url,
+            "Registered adapter %s with router at %s",
+            self.adapter_url,
             router_url,
         )
 
     def _bump_weight_version(self, version: int | None = None):
-        """Notify the sidecar to increment (or set) its weight version counter."""
-        url = f"{self.sidecar_url}/set_weight_version"
+        """Notify the adapter to increment (or set) its weight version counter."""
+        url = f"{self.adapter_url}/set_weight_version"
         payload = {"weight_version": version} if version is not None else {}
         try:
             r = requests.post(url, json=payload, timeout=10)
             r.raise_for_status()
             self._weight_version = r.json().get("weight_version", self._weight_version)
         except Exception as exc:
-            logger.warning("Failed to bump sidecar weight version: %s", exc)
+            logger.warning("Failed to bump adapter weight version: %s", exc)
 
     def _read_log_tail(self, n=200):
         if not self._log_file:
@@ -287,7 +287,7 @@ class VLLMEngine(RayActor):
                 "packed": packed,
             }
         })
-        # Notify the sidecar about the new weight version
+        # Notify the adapter about the new weight version
         self._bump_weight_version(weight_version)
 
     def continue_generation(self):
@@ -312,9 +312,9 @@ class VLLMEngine(RayActor):
             logger.warning("vLLM wake_up failed: %s", e)
 
     def get_weight_version(self):
-        if self.sidecar_port:
+        if self.adapter_port:
             try:
-                r = requests.get(f"{self.sidecar_url}/get_weight_version", timeout=5)
+                r = requests.get(f"{self.adapter_url}/get_weight_version", timeout=5)
                 r.raise_for_status()
                 return r.json().get("weight_version", self._weight_version)
             except Exception:
@@ -328,16 +328,16 @@ class VLLMEngine(RayActor):
         pass
 
     def shutdown(self):
-        # Shutdown translation sidecar first
-        if self.sidecar_process and self.sidecar_process.is_alive():
-            self.sidecar_process.terminate()
-            self.sidecar_process.join(timeout=10)
-            if self.sidecar_process.is_alive():
-                self.sidecar_process.kill()
-            self.sidecar_process = None
-        if self._sidecar_log_file:
+        # Shutdown rollout adapter first
+        if self.adapter_process and self.adapter_process.is_alive():
+            self.adapter_process.terminate()
+            self.adapter_process.join(timeout=10)
+            if self.adapter_process.is_alive():
+                self.adapter_process.kill()
+            self.adapter_process = None
+        if self._adapter_log_file:
             try:
-                self._sidecar_log_file.close()
+                self._adapter_log_file.close()
             except Exception:
                 pass
 

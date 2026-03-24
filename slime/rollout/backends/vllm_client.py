@@ -24,7 +24,7 @@ class VLLMClient(RolloutBackendClient):
        ``/v1/completions`` endpoint and parses the native vLLM response.
     2. **Router mode** (``use_slime_router=True``): sends SGLang-format
        requests to ``/generate`` through the SlimeRouter, which forwards
-       to the translation sidecar. The sidecar handles the vLLM translation
+       to the vLLM rollout adapter. The adapter handles the vLLM translation
        and returns SGLang-format responses.
     """
 
@@ -36,7 +36,7 @@ class VLLMClient(RolloutBackendClient):
     @property
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities(
-            supports_abort=self._use_router,  # abort is supported through the sidecar
+            supports_abort=self._use_router,  # abort is supported through the adapter
             supports_routed_experts=False,
             supports_prompt_logprobs=False,
         )
@@ -52,7 +52,7 @@ class VLLMClient(RolloutBackendClient):
         return await self._generate_direct(request, base_url, headers)
 
     # ------------------------------------------------------------------
-    # Router mode: SGLang-format /generate → sidecar → vLLM
+    # Router mode: SGLang-format /generate → adapter → vLLM
     # ------------------------------------------------------------------
 
     async def _generate_via_router(
@@ -61,7 +61,7 @@ class VLLMClient(RolloutBackendClient):
         base_url: str,
         headers: dict | None = None,
     ) -> RolloutBackendResponse:
-        """Send SGLang-format request through the SlimeRouter → sidecar pipeline."""
+        """Send SGLang-format request through the SlimeRouter → adapter pipeline."""
 
         payload = {
             "input_ids": request.input_ids,
@@ -75,7 +75,7 @@ class VLLMClient(RolloutBackendClient):
         url = f"{base_url.rstrip('/')}/generate"
         output = await post(url, payload, headers=headers)
 
-        # Parse SGLang-format response (produced by translation sidecar)
+        # Parse SGLang-format response (produced by vLLM rollout adapter)
         meta = output.get("meta_info", {})
         logprobs_data = meta.get("output_token_logprobs", [])
 

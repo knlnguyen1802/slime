@@ -26,8 +26,8 @@ This RFC covers **only the router layer** — what APIs the vLLM backend must ex
                                               │
                                    ┌──────────▼───────────┐
                                    │ SlimeRouter.proxy()   │         ┌─────────────────────┐
-                                   │  • least-connections  │────────▶│ vLLM Translation    │
-                                   │    load balancer      │         │ Sidecar (per engine) │
+                                   │  • least-connections  │────────▶│ vLLM Rollout        │
+                                   │    load balancer      │         │ Adapter (per engine) │
                                    │  • health check loop  │         │                     │
                                    └──────────────────────┘         │ POST /generate      │
                                                                      │   ↓ translate        │
@@ -60,8 +60,8 @@ This RFC covers **only the router layer** — what APIs the vLLM backend must ex
 
 | Component | Description |
 |---|---|
-| `vllm_translation_sidecar.py` | Lightweight FastAPI process co-located with each vLLM engine. Receives SGLang-format `/generate` requests, translates to vLLM's `/v1/completions`, translates responses back. Also proxies lifecycle endpoints (`/abort_request`, `/health_generate`, etc.). |
-| `vllm_engine.py` | Ray actor that manages the vLLM server process lifecycle (via `vllm serve`), the translation sidecar, weight updates, and registration with the router. |
+| `vllm_rollout_adapter.py` | Lightweight FastAPI process co-located with each vLLM engine. Receives SGLang-format `/generate` requests, translates to vLLM's `/v1/completions`, translates responses back. Also proxies lifecycle endpoints (`/abort_request`, `/health_generate`, etc.). |
+| `vllm_engine.py` | Ray actor that manages the vLLM server process lifecycle (via `vllm serve`), the rollout adapter, weight updates, and registration with the router. |
 
 ---
 
@@ -79,15 +79,15 @@ Router state after registration:
   worker_failure_counts["http://10.0.0.1:10090"] = 0
 ```
 
-**vLLM action:** The `VLLMEngine` Ray actor calls this endpoint after verifying the vLLM server + translation sidecar are healthy. The registered URL points to the **sidecar**, not the raw vLLM server. No router change needed.
+**vLLM action:** The `VLLMEngine` Ray actor calls this endpoint after verifying the vLLM server + rollout adapter are healthy. The registered URL points to the **adapter**, not the raw vLLM server. No router change needed.
 
 ### 2.2 Request Proxying
 
-**Flow:** `POST /generate` → middleware pipeline → `SlimeRouter.proxy()` → `httpx` forwards to backend (sidecar).
+**Flow:** `POST /generate` → middleware pipeline → `SlimeRouter.proxy()` → `httpx` forwards to backend (adapter).
 
 The router selects a backend via **least-connections** (`_use_url()`), forwards the raw request body as-is, and returns the response as-is. It never inspects or transforms the request/response payload.
 
-**vLLM action:** The sidecar receives the forwarded request, translates it to `/v1/completions`, calls the co-located vLLM server, translates the response back to SGLang format, and returns it.
+**vLLM action:** The adapter receives the forwarded request, translates it to `/v1/completions`, calls the co-located vLLM server, translates the response back to SGLang format, and returns it.
 
 ### 2.3 Health Check
 
@@ -97,7 +97,7 @@ The router selects a backend via **least-connections** (`_use_url()`), forwards 
 - Non-200 or timeout → increment failure count
 - Failures ≥ threshold (default 3) → quarantine worker permanently
 
-**vLLM action:** The sidecar's `/health` proxies to vLLM's built-in `/health` endpoint (returns 200 when ready). Compatible out of the box.
+**vLLM action:** The adapter's `/health` proxies to vLLM's built-in `/health` endpoint (returns 200 when ready). Compatible out of the box.
 
 ### 2.4 Worker Listing
 
@@ -113,13 +113,13 @@ Fully router-internal. Never reaches the engine.
 
 ---
 
-## 3. API Contract — What the Translation Sidecar Must Expose
+## 3. API Contract — What the vLLM Rollout Adapter Must Expose
 
-The translation sidecar sits between SlimeRouter and the vLLM server. It receives SGLang-format requests and returns SGLang-format responses.
+The vLLM rollout adapter sits between SlimeRouter and the vLLM server. It receives SGLang-format requests and returns SGLang-format responses.
 
 ### 3.1 `POST /generate` — Generation
 
-This is the primary endpoint. The sidecar translates between Slime's format and vLLM's `/v1/completions`.
+This is the primary endpoint. The adapter translates between Slime's format and vLLM's `/v1/completions`.
 
 #### Incoming Request (from router)
 
@@ -224,7 +224,7 @@ This is the primary endpoint. The sidecar translates between Slime's format and 
 | `output_ids` | `list[int]` | **Yes** | Middleware | Generated token IDs. Middleware checks existence as a gate for caching. |
 | `meta_info.output_token_logprobs` | `list[[float, int]]` | **Yes** (if `return_logprob`) | Rollout, Middleware | Each element is `[logprob, token_id]`. Used for RL policy ratio calculation. |
 | `meta_info.finish_reason` | `{"type": str}` | **Yes** | Rollout, Middleware | Must be `{"type": "stop"}`, `{"type": "length"}`, or `{"type": "abort"}`. **Not** a plain string. |
-| `meta_info.weight_version` | `int` | **Yes** | Middleware, Rollout | Current model weight version. Tracked by the sidecar (incremented on each weight update). |
+| `meta_info.weight_version` | `int` | **Yes** | Middleware, Rollout | Current model weight version. Tracked by the adapter (incremented on each weight update). |
 | `meta_info.prompt_tokens` | `int` | Nice-to-have | Rollout (stats) | From `usage.prompt_tokens`. |
 | `meta_info.cached_tokens` | `int` | Nice-to-have | Rollout (stats) | vLLM doesn't expose this directly; default to `0`. |
 
@@ -232,7 +232,7 @@ This is the primary endpoint. The sidecar translates between Slime's format and 
 
 ```
 GET /health
-→ Sidecar proxies to vLLM's GET /health
+→ Adapter proxies to vLLM's GET /health
 → 200 OK        (engine ready)
 → 503 or timeout (engine not ready / overloaded)
 ```
@@ -252,7 +252,7 @@ Called **directly** by the rollout to each engine (bypasses the router). The rol
 **vLLM approach:** vLLM uses **HTTP connection close** for abort (via its `@with_cancellation` decorator). When a client disconnects, the in-flight request is automatically cancelled.
 
 **Implementation options:**
-1. **Track active connections.** The sidecar maintains a set of active `httpx` connections to the vLLM server. On `POST /abort_request`, close all of them — triggering vLLM's cancellation.
+1. **Track active connections.** The adapter maintains a set of active `httpx` connections to the vLLM server. On `POST /abort_request`, close all of them — triggering vLLM's cancellation.
 2. **Use vLLM's `/pause` endpoint.** Call `POST /pause` to block new requests, then `POST /resume` after the RL training step completes. This is semantically closer to how Slime uses abort (clearing the decks between training generations).
 
 > **Note:** vLLM has `POST /abort_requests` only in disaggregated mode. For standard mode, HTTP disconnect is the canonical abort mechanism.
@@ -264,11 +264,11 @@ GET /health_generate
 → 200 OK        (model loaded, engine ready for generation)
 ```
 
-Called by `VLLMEngine.init()` during startup to block until the engine is fully ready. The sidecar implements this by calling vLLM's `GET /health` and optionally performing a dummy `/v1/completions` call with `max_tokens=1` to verify end-to-end readiness.
+Called by `VLLMEngine.init()` during startup to block until the engine is fully ready. The adapter implements this by calling vLLM's `GET /health` and optionally performing a dummy `/v1/completions` call with `max_tokens=1` to verify end-to-end readiness.
 
 ### 3.5 Sampling Params Translation
 
-The request uses SGLang-format parameter names. The sidecar translates to vLLM's `/v1/completions` format:
+The request uses SGLang-format parameter names. The adapter translates to vLLM's `/v1/completions` format:
 
 | SGLang field (in request) | vLLM `/v1/completions` field | Notes |
 |---|---|---|
@@ -351,15 +351,15 @@ vllm serve <model_path> \
     --disable-log-requests
 ```
 
-The translation sidecar runs on a separate port (`<sidecar_port>`) and is the URL registered with the router via `POST /add_worker?url=http://{host}:{sidecar_port}`.
+The rollout adapter runs on a separate port (`<adapter_port>`) and is the URL registered with the router via `POST /add_worker?url=http://{host}:{adapter_port}`.
 
 ```
                 Router
                   │
                   ▼
     ┌─────────────────────────┐
-    │ Translation Sidecar     │  ◄── registered with router
-    │ port: sidecar_port      │
+    │ vLLM Rollout Adapter    │  ◄── registered with router
+    │ port: adapter_port      │
     │                         │
     │ /generate ──translate──▶│──┐
     │ /health ──passthrough──▶│  │
@@ -398,7 +398,7 @@ vLLM's abort mechanism differs fundamentally from SGLang's:
 For the Slime RL use case, the rollout calls `abort_all` between generation rounds (to clear the engine before the next batch). The best vLLM equivalent is:
 
 ```python
-# In the translation sidecar
+# In the rollout adapter
 @app.post("/abort_request")
 async def abort_request(request: Request):
     body = await request.json()
@@ -435,7 +435,7 @@ async def abort_request(request: Request):
 | `POST /update_weights` | — | ✅ (dev mode) | **Reuse** for NCCL weight apply |
 | `GET /get_world_size` | — | ✅ (dev mode) | **Reuse** for TP world size |
 
-### Translation sidecar endpoints (to implement)
+### Rollout adapter endpoints (to implement)
 
 | Endpoint | Description | Complexity |
 |---|---|---|
@@ -444,7 +444,7 @@ async def abort_request(request: Request):
 | `GET /health_generate` | Health + optional dummy completion | **Low** |
 | `POST /abort_request` | Close connections or pause/resume | **Low** |
 | `GET /flush_cache` | `POST /sleep?level=1` + `POST /wake_up?tags=kv_cache` | **Low** |
-| `GET /get_weight_version` | Return sidecar-tracked version counter | **Trivial** |
+| `GET /get_weight_version` | Return adapter-tracked version counter | **Trivial** |
 
 ### Router endpoints (no change needed)
 
@@ -456,7 +456,6 @@ async def abort_request(request: Request):
 | Catch-all proxy | No change |
 
 ---
-
 
 
 

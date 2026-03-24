@@ -1025,7 +1025,7 @@ def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     """Start vLLM rollout server(s) with optional SlimeRouter.
 
     When ``args.use_slime_router`` is True, a SlimeRouter is launched first
-    and each vLLM engine registers its translation sidecar with the router.
+    and each vLLM engine registers its rollout adapter with the router.
     Otherwise, a single engine is started and used directly (no router).
     """
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg

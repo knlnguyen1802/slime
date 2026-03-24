@@ -1,6 +1,6 @@
 """
-vLLM Translation Sidecar
-========================
+vLLM Rollout Adapter
+====================
 
 Lightweight FastAPI process co-located with each vLLM engine.
 Receives SGLang-format ``/generate`` requests from the SlimeRouter,
@@ -149,12 +149,12 @@ def translate_vllm_response(
 
 
 # ---------------------------------------------------------------------------
-# Sidecar application
+# Rollout adapter application
 # ---------------------------------------------------------------------------
 
 
-class TranslationSidecar:
-    """Manages state and provides the FastAPI app for the translation sidecar."""
+class vLLMRolloutAdapter:
+    """Manages state and provides the FastAPI app for the vLLM rollout adapter."""
 
     def __init__(
         self,
@@ -202,7 +202,7 @@ class TranslationSidecar:
             yield
             await self.shutdown()
 
-        app = FastAPI(title="vLLM Translation Sidecar", lifespan=lifespan)
+        app = FastAPI(title="vLLM Rollout Adapter", lifespan=lifespan)
 
         app.post("/generate")(self.generate)
         app.get("/health")(self.health)
@@ -381,7 +381,7 @@ class TranslationSidecar:
             return JSONResponse(content={"status": "ok"})
 
     async def get_weight_version(self):
-        """Return the sidecar-tracked weight version counter."""
+        """Return the adapter-tracked weight version counter."""
         return JSONResponse(content={"weight_version": self._weight_version})
 
     async def set_weight_version(self, request: Request):
@@ -399,50 +399,50 @@ class TranslationSidecar:
 # ---------------------------------------------------------------------------
 
 
-def run_sidecar(
+def run_vllm_rollout_adapter(
     vllm_host: str = "127.0.0.1",
     vllm_port: int = 8000,
-    sidecar_host: str = "0.0.0.0",
-    sidecar_port: int = 8100,
+    adapter_host: str = "0.0.0.0",
+    adapter_port: int = 8100,
     model_name: str = "default",
     timeout: float = 600.0,
     max_connections: int = 256,
     log_level: str = "info",
 ):
-    """Launch the translation sidecar as a standalone uvicorn process."""
+    """Launch the vLLM rollout adapter as a standalone uvicorn process."""
 
     vllm_base_url = f"http://{vllm_host}:{vllm_port}"
-    sidecar = TranslationSidecar(
+    adapter = vLLMRolloutAdapter(
         vllm_base_url=vllm_base_url,
         model_name=model_name,
         timeout=timeout,
         max_connections=max_connections,
     )
     uvicorn.run(
-        sidecar.app,
-        host=sidecar_host,
-        port=sidecar_port,
+        adapter.app,
+        host=adapter_host,
+        port=adapter_port,
         log_level=log_level,
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="vLLM Translation Sidecar")
+    parser = argparse.ArgumentParser(description="vLLM Rollout Adapter")
     parser.add_argument("--vllm-host", type=str, default="127.0.0.1")
     parser.add_argument("--vllm-port", type=int, default=8000)
-    parser.add_argument("--sidecar-host", type=str, default="0.0.0.0")
-    parser.add_argument("--sidecar-port", type=int, default=8100)
+    parser.add_argument("--adapter-host", type=str, default="0.0.0.0")
+    parser.add_argument("--adapter-port", type=int, default=8100)
     parser.add_argument("--model-name", type=str, default="default")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-connections", type=int, default=256)
     parser.add_argument("--log-level", type=str, default="info")
     args = parser.parse_args()
 
-    run_sidecar(
+    run_vllm_rollout_adapter(
         vllm_host=args.vllm_host,
         vllm_port=args.vllm_port,
-        sidecar_host=args.sidecar_host,
-        sidecar_port=args.sidecar_port,
+        adapter_host=args.adapter_host,
+        adapter_port=args.adapter_port,
         model_name=args.model_name,
         timeout=args.timeout,
         max_connections=args.max_connections,

@@ -64,8 +64,13 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
         # process may have this patch active, so CUDA IPC pickle data references
         # the wrapper.  In this fresh subprocess the patch hasn't run, so we must
         # ensure _rebuild_cuda_tensor_original exists for deserialization.
+        # PyTorch 2.6+ exposes rebuild_cuda_tensor; older versions used _rebuild_cuda_tensor.
         if not hasattr(_reductions, "_rebuild_cuda_tensor_original"):
-            _reductions._rebuild_cuda_tensor_original = _reductions._rebuild_cuda_tensor
+            _rebuild_cuda = getattr(_reductions, "_rebuild_cuda_tensor", None) or getattr(
+                _reductions, "rebuild_cuda_tensor", None
+            )
+            if _rebuild_cuda is not None:
+                _reductions._rebuild_cuda_tensor_original = _rebuild_cuda
 
         torch.cuda.set_device(device)
 

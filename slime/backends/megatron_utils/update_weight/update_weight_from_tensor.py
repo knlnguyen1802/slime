@@ -90,12 +90,6 @@ class UpdateWeightFromTensor:
                 break
             colocate_engine_nums += 1
 
-        # vLLM uses NCCL (via NcclBridge) for weight transfer, not SGLang-style
-        # IPC (FlattenedTensorBucket).  Route all vLLM engines through the
-        # distributed NCCL path regardless of colocation.
-        if _is_vllm_backend(self.args):
-            colocate_engine_nums = 0
-
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
         if self.use_distribute:

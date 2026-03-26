@@ -64,7 +64,13 @@ class VLLMEngine(RayActor):
 
         seed = getattr(self.args, "seed", 1234) + self.rank
         colocate = getattr(self.args, "colocate", False)
+        # SGLang has no weight-transfer CLI flag: colocated sync goes through
+        # ``update_weights_from_tensor`` and the server copies from GPU via its own IPC path.
+        # vLLM requires ``--weight-transfer-config`` at serve time. Match that split:
+        # - colocate + ``update_weights_from_tensor`` → IPC handles on ``/update_weights`` → backend "ipc"
+        # - non-colocate + ``init_weights_update_group`` / packed NCCL → backend "nccl"
         wt_backend = "ipc" if colocate else "nccl"
+        logger.info("vLLM weight-transfer backend=%s (colocate=%s)", wt_backend, colocate)
         cmd = [
             "vllm", "serve", model,
             "--tensor-parallel-size", str(tp),
@@ -281,10 +287,11 @@ class VLLMEngine(RayActor):
     ):
         """Load colocated weights — same interface as SGLangEngine.
 
-        Deserializes ``FlattenedTensorBucket`` data produced by the training
-        side, moves tensors to GPU, builds CUDA IPC handles with plain torch,
-        and POSTs them to the vLLM server's ``/update_weights`` endpoint.
-        No vLLM Python imports are needed.
+        Like ``SGLangEngine.update_weights_from_tensor`` (HTTP + GPU tensor metadata),
+        but vLLM expects CUDA IPC handles in ``/update_weights`` instead of SGLang's
+        serialized buckets. Requires the vLLM process to have been started with
+        ``--weight-transfer-config`` backend ``ipc`` (done automatically when
+        ``--colocate`` is set in ``init``).
         """
         import pickle
 

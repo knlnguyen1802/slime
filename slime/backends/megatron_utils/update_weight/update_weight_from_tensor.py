@@ -14,6 +14,7 @@ from slime.utils.distributed_utils import get_gloo_group
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
+    _is_vllm_backend,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     post_process_weights,
@@ -141,15 +142,22 @@ class UpdateWeightFromTensor:
         """
         self.weight_version += 1
 
+        # Include distributed engines in lifecycle management so that vLLM
+        # engines (which are always routed to the distributed path) are
+        # properly paused/flushed/continued.
+        all_engines = list(self.rollout_engines)
+        if self.use_distribute:
+            all_engines.extend(self.distributed_rollout_engines)
+
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            ray.get([engine.pause_generation.remote() for engine in all_engines])
+            ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=all_engines,
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -168,9 +176,9 @@ class UpdateWeightFromTensor:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=all_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
@@ -192,6 +200,7 @@ class UpdateWeightFromTensor:
                 self.weight_version,
                 self.distributed_rollout_engines,
                 hf_named_tensors,
+                use_vllm=_is_vllm_backend(self.args),
             )
             if refs_distributed:
                 all_refs.extend(refs_distributed)

@@ -127,9 +127,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 1 \
-   --num-gpus-per-node 2 \
-   --rollout-num-gpus 1 \
+   --actor-num-gpus-per-node 2 \
+   --colocate \
    --calculate-per-token-loss \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

@@ -32,6 +32,7 @@ class VLLMEngine(RayActor):
         self._log_file = None
         self._sidecar_log_file = None
         self._weight_version: int = 0
+        self._ipc_initialized: bool = False
 
     @property
     def sidecar_url(self) -> str:
@@ -62,12 +63,15 @@ class VLLMEngine(RayActor):
             dev_str = ",".join(str(g) for g in gpu_ids)
 
         seed = getattr(self.args, "seed", 1234) + self.rank
+        colocate = getattr(self.args, "colocate", False)
+        wt_backend = "ipc" if colocate else "nccl"
+        logger.info("vLLM weight-transfer backend=%s (colocate=%s)", wt_backend, colocate)
         cmd = [
             "vllm", "serve", model,
             "--tensor-parallel-size", str(tp),
             "--port", str(self.server_port),
             "--host", "0.0.0.0",
-            "--weight-transfer-config", '{"backend": "nccl"}',
+            "--weight-transfer-config", f'{{"backend": "{wt_backend}"}}',
             "--seed", str(seed),
             "--trust-remote-code",
         ]
@@ -83,6 +87,8 @@ class VLLMEngine(RayActor):
         env = os.environ.copy()
         env["VLLM_SERVER_DEV_MODE"] = "1"
         env["CUDA_VISIBLE_DEVICES"] = dev_str
+        if colocate:
+            env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         env.setdefault("NCCL_DEBUG", "INFO")
         env.setdefault("NCCL_DEBUG_SUBSYS", "ALL")
         env["NCCL_P2P_DISABLE"] = "1"
@@ -266,6 +272,90 @@ class VLLMEngine(RayActor):
         })
         log_tail = self._read_log_tail(30)
         logger.info("vLLM log after init_weight_transfer_engine:\n%s", log_tail)
+
+    def update_weights_from_tensor(
+        self,
+        serialized_named_tensors: list[str],
+        load_format: str | None = None,
+        flush_cache: bool = False,
+        weight_version: str | None = None,
+    ):
+        """Load colocated weights via CUDA IPC handles.
+
+        Deserializes SGLang-style flattened tensor buckets, moves them to GPU,
+        builds CUDA IPC handles, and posts them to vLLM's ``/update_weights``
+        endpoint.  Requires the vLLM process to have been started with
+        ``--weight-transfer-config`` backend ``ipc`` (set automatically when
+        ``--colocate`` is active).
+        """
+        import pickle
+
+        import torch
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        try:
+            import pybase64 as base64
+        except ImportError:
+            import base64
+
+        from slime.backends.megatron_utils.weight_sync_utils import FlattenedTensorBucket, MultiprocessingSerializer
+
+        if not self._ipc_initialized:
+            self._post("/init_weight_transfer_engine", json_data={"init_info": {}})
+            self._ipc_initialized = True
+
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        target = self.gpu_ids[0]
+        if cvd:
+            visible = [int(x) for x in cvd.split(",") if x.strip()]
+            if target in visible:
+                device_idx = visible.index(target)
+            elif target < len(visible):
+                device_idx = target
+            else:
+                device_idx = 0
+        else:
+            device_idx = target
+        torch.cuda.set_device(device_idx)
+        device = f"cuda:{device_idx}"
+
+        props = torch.cuda.get_device_properties(device_idx)
+        gpu_uuid = str(props.uuid)
+
+        names: list[str] = []
+        dtype_names: list[str] = []
+        shapes: list[list[int]] = []
+        ipc_handles: list[dict] = []
+        live_tensors: list[torch.Tensor] = []
+
+        for serialized in serialized_named_tensors:
+            data = MultiprocessingSerializer.deserialize(serialized)
+            bucket = FlattenedTensorBucket(
+                metadata=data["metadata"],
+                flattened_tensor=data["flattened_tensor"],
+            )
+            for name, tensor in bucket.reconstruct_tensors():
+                gpu_t = tensor.to(device).detach().contiguous()
+                live_tensors.append(gpu_t)
+                names.append(name)
+                dtype_names.append(str(gpu_t.dtype).split(".")[-1])
+                shapes.append(list(gpu_t.shape))
+                ipc_handles.append({gpu_uuid: reduce_tensor(gpu_t)})
+
+        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+        self._post("/update_weights", json_data={
+            "update_info": {
+                "names": names,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "ipc_handles_pickled": pickled,
+            }
+        })
+
+        del live_tensors
+
+        if weight_version is not None:
+            self._bump_weight_version(int(weight_version))
 
     def update_weights_from_distributed(
         self,

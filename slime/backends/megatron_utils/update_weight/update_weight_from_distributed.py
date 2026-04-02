@@ -57,6 +57,21 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
 
         import torch
         import torch.multiprocessing  # ensure CUDA IPC reducers are registered
+        import torch.multiprocessing.reductions as _reductions
+
+        # SGLang's monkey_patch_torch_reductions() replaces _rebuild_cuda_tensor
+        # with a wrapper that calls _rebuild_cuda_tensor_original.  The parent
+        # process may have this patch active, so CUDA IPC pickle data references
+        # the wrapper.  In this fresh subprocess the patch hasn't run, so we must
+        # ensure _rebuild_cuda_tensor_original exists for deserialization.
+        # PyTorch 2.6+ exposes rebuild_cuda_tensor; older versions used _rebuild_cuda_tensor.
+        if not hasattr(_reductions, "_rebuild_cuda_tensor_original"):
+            _rebuild_cuda = getattr(_reductions, "_rebuild_cuda_tensor", None) or getattr(
+                _reductions, "rebuild_cuda_tensor", None
+            )
+            if _rebuild_cuda is not None:
+                _reductions._rebuild_cuda_tensor_original = _rebuild_cuda
+
         torch.cuda.set_device(device)
 
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator

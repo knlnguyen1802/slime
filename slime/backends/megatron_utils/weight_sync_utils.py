@@ -33,6 +33,41 @@ logger = logging.getLogger(__name__)
 #   False – CUDA IPC unavailable (expandable_segments:True or similar)
 _cuda_ipc_available: bool | None = None
 
+
+def check_cuda_ipc_available() -> bool:
+    """Proactively check whether CUDA IPC handles can be created.
+
+    ``expandable_segments:True`` (the common cause) makes the CUDA caching
+    allocator use ``cuMemCreate`` / ``cuMemMap`` instead of ``cudaMalloc``.
+    Memory obtained that way is fundamentally incompatible with
+    ``cudaIpcGetMemHandle``, which ``storage._share_cuda_()`` relies on.
+
+    This function allocates a tiny 1-byte probe tensor, tries to create an
+    IPC handle, and caches the result for the process lifetime.
+    """
+    global _cuda_ipc_available
+    if _cuda_ipc_available is not None:
+        return _cuda_ipc_available
+
+    if not torch.cuda.is_available():
+        _cuda_ipc_available = False
+        return False
+
+    try:
+        probe = torch.zeros(1, device="cuda")
+        probe.untyped_storage()._share_cuda_()
+        _cuda_ipc_available = True
+    except Exception:
+        _cuda_ipc_available = False
+        logger.warning(
+            "CUDA IPC is unavailable (commonly caused by "
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). "
+            "Weight sync will transfer tensors via CPU instead of "
+            "zero-copy GPU IPC."
+        )
+    return _cuda_ipc_available
+
+
 # ── FlattenedTensorBucket ───────────────────────────────────────────
 
 
@@ -207,42 +242,23 @@ class MultiprocessingSerializer:
 
     When CUDA IPC is unavailable (e.g. ``expandable_segments:True`` makes the
     allocator use ``cuMemCreate``/``cuMemMap`` instead of ``cudaMalloc``),
-    tensors are transparently moved to CPU before serialization so that the
-    transfer falls back to CPU shared-memory instead of crashing.
+    tensors are proactively moved to CPU before serialization so that the
+    transfer falls back to embedded-data pickle instead of crashing.
     """
 
     @staticmethod
     def serialize(obj, output_str: bool = False):
-        global _cuda_ipc_available
-
-        # Fast path: we already know CUDA IPC is broken – skip straight to CPU
-        # and use regular pickle (embeds data in bytes, no shared-memory refs).
-        if _cuda_ipc_available is False:
-            obj = _cuda_tensors_to_cpu(obj)
-            buf = io.BytesIO()
-            pickle.Pickler(buf).dump(obj)
+        buf = io.BytesIO()
+        if check_cuda_ipc_available():
+            # Normal path: ForkingPickler creates CUDA IPC handles for GPU
+            # tensors, giving zero-copy weight sharing with the engine.
+            ForkingPickler(buf).dump(obj)
         else:
-            buf = io.BytesIO()
-            try:
-                ForkingPickler(buf).dump(obj)
-                # If we get here on the first call, CUDA IPC works.
-                if _cuda_ipc_available is None:
-                    _cuda_ipc_available = True
-            except Exception as e:
-                if not _is_cuda_ipc_error(e):
-                    raise
-                # First-time probe: CUDA IPC failed → switch to CPU fallback.
-                _cuda_ipc_available = False
-                logger.warning(
-                    "CUDA IPC serialization failed (%s). Falling back to CPU "
-                    "tensor transfer.  For zero-copy GPU weight sharing, set "
-                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False",
-                    e,
-                )
-                buf = io.BytesIO()
-                obj = _cuda_tensors_to_cpu(obj)
-                pickle.Pickler(buf).dump(obj)
-
+            # Fallback: move CUDA tensors to CPU and use plain pickle which
+            # embeds the tensor bytes directly (no IPC handles, no shared-
+            # memory file descriptors that could become stale).
+            obj = _cuda_tensors_to_cpu(obj)
+            pickle.Pickler(buf).dump(obj)
         buf.seek(0)
         output = buf.read()
         if output_str:
@@ -254,18 +270,6 @@ class MultiprocessingSerializer:
         if isinstance(data, str):
             data = base64.b64decode(data, validate=True)
         return SafeUnpickler(io.BytesIO(data)).load()
-
-
-def _is_cuda_ipc_error(exc: BaseException) -> bool:
-    """Return *True* if *exc* looks like a CUDA IPC / share_cuda failure."""
-    # PyTorch ≥ 2.6 raises torch.AcceleratorError; older versions raise
-    # RuntimeError with "CUDA error" in the message.
-    exc_name = type(exc).__name__
-    if "AcceleratorError" in exc_name or "CudaError" in exc_name:
-        return True
-    if isinstance(exc, RuntimeError) and "CUDA error" in str(exc):
-        return True
-    return False
 
 
 def _cuda_tensors_to_cpu(obj):

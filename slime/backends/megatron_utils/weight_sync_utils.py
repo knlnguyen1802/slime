@@ -315,6 +315,16 @@ def _reduce_tensor_modified(*args, **kwargs):
 
 
 def _rebuild_cuda_tensor_modified(*args):
+    # Ensure _rebuild_cuda_tensor_original exists even in processes where
+    # monkey_patch_torch_reductions() was never called (e.g. vLLM server
+    # subprocess).  This mirrors the fixup already present in
+    # update_weight_from_distributed.py for NcclBridge subprocesses.
+    if not hasattr(reductions, "_rebuild_cuda_tensor_original"):
+        _rebuild_cuda = getattr(reductions, "_rebuild_cuda_tensor", None) or getattr(
+            reductions, "rebuild_cuda_tensor", None
+        )
+        if _rebuild_cuda is not None and _rebuild_cuda is not _rebuild_cuda_tensor_modified:
+            reductions._rebuild_cuda_tensor_original = _rebuild_cuda
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
     return reductions._rebuild_cuda_tensor_original(*args)
 

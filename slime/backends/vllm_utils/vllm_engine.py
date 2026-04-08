@@ -16,6 +16,31 @@ from slime.utils.misc import get_free_port
 logger = logging.getLogger(__name__)
 
 
+def _strip_expandable_segments_from_env():
+    """Remove ``expandable_segments`` from ``PYTORCH_CUDA_ALLOC_CONF``.
+
+    ``expandable_segments:True`` makes PyTorch's CUDA caching allocator use
+    ``cuMemCreate`` / ``cuMemMap`` instead of ``cudaMalloc``.  Memory obtained
+    that way is incompatible with ``cudaIpcGetMemHandle`` which is needed by
+    ``reduce_tensor()`` / ``storage._share_cuda_()``.
+
+    This function must be called **before** any CUDA context is created in the
+    process (i.e. before ``torch.cuda`` is used) to take effect.
+    """
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in alloc_conf:
+        return
+    parts = [p.strip() for p in alloc_conf.split(",") if p.strip()]
+    parts = [p for p in parts if not p.startswith("expandable_segments")]
+    parts.append("expandable_segments:False")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
+    logger.info(
+        "Disabled expandable_segments in PYTORCH_CUDA_ALLOC_CONF for "
+        "CUDA IPC compatibility (new value: %s).",
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+    )
+
+
 class VLLMEngine(RayActor):
     """Ray actor that runs vLLM server with same interface as SGLangEngine for weight sync."""
 
@@ -33,6 +58,14 @@ class VLLMEngine(RayActor):
         self._sidecar_log_file = None
         self._weight_version: int = 0
         self._ipc_initialized: bool = False
+
+        # CUDA IPC (cudaIpcGetMemHandle) is incompatible with the
+        # expandable_segments allocator.  Disable it *before* any CUDA
+        # context is created in this Ray worker process so that
+        # reduce_tensor() in update_weights_from_tensor() can succeed.
+        colocate = getattr(self.args, "colocate", False)
+        if colocate:
+            _strip_expandable_segments_from_env()
 
     @property
     def sidecar_url(self) -> str:
@@ -89,6 +122,14 @@ class VLLMEngine(RayActor):
         env["CUDA_VISIBLE_DEVICES"] = dev_str
         if colocate:
             env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+            # CUDA IPC (cudaIpcGetMemHandle) is incompatible with the
+            # expandable_segments allocator (cuMemCreate/cuMemMap).  Strip it
+            # from the child env so the vLLM process can accept IPC handles.
+            alloc_conf = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
+            parts = [p.strip() for p in alloc_conf.split(",") if p.strip()]
+            parts = [p for p in parts if not p.startswith("expandable_segments")]
+            parts.append("expandable_segments:False")
+            env["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
         env.setdefault("NCCL_DEBUG", "INFO")
         env.setdefault("NCCL_DEBUG_SUBSYS", "ALL")
         env["NCCL_P2P_DISABLE"] = "1"
@@ -298,7 +339,11 @@ class VLLMEngine(RayActor):
         except ImportError:
             import base64
 
-        from slime.backends.megatron_utils.weight_sync_utils import FlattenedTensorBucket, MultiprocessingSerializer
+        from slime.backends.megatron_utils.weight_sync_utils import (
+            FlattenedTensorBucket,
+            MultiprocessingSerializer,
+            monkey_patch_torch_reductions,
+        )
 
         if not self._ipc_initialized:
             self._post("/init_weight_transfer_engine", json_data={"init_info": {}})
@@ -321,6 +366,10 @@ class VLLMEngine(RayActor):
 
         props = torch.cuda.get_device_properties(device_idx)
         gpu_uuid = str(props.uuid)
+
+        # Monkey-patch reductions so device ordinals are replaced by UUIDs,
+        # which avoids mis-mapping when CUDA_VISIBLE_DEVICES remaps GPUs.
+        monkey_patch_torch_reductions()
 
         names: list[str] = []
         dtype_names: list[str] = []

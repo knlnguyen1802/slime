@@ -67,6 +67,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         super().init(args, role, with_ref, with_opd_teacher)
 
+        # Lock in expandable_segments:False *after* CUDA context creation
+        # but *before* Megatron init, which may reconfigure the allocator.
+        if getattr(args, "colocate", False):
+            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+
         if args.debug_rollout_only:
             return 0
 
@@ -74,8 +79,21 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # In colocated mode CUDA IPC is mandatory – fail fast rather than
         # silently falling back to CPU transfers that crash vLLM later.
+        # Re-enforce expandable_segments:False after Megatron init in case
+        # Megatron-LM or TransformerEngine overrode the allocator settings.
         if getattr(args, "colocate", False):
-            from slime.backends.megatron_utils.weight_sync_utils import assert_cuda_ipc_available
+            from slime.backends.megatron_utils.weight_sync_utils import (
+                _strip_expandable_segments_env,
+                assert_cuda_ipc_available,
+            )
+            import slime.backends.megatron_utils.weight_sync_utils as _wsu
+            _strip_expandable_segments_env()
+            torch.cuda.empty_cache()
+            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+            logger.info("Re-applied expandable_segments:False after Megatron init.")
+            # Reset the cached probe result so we get a fresh probe after
+            # the allocator reconfiguration.
+            _wsu._cuda_ipc_available = None
             assert_cuda_ipc_available()
 
         if is_megatron_main_rank():

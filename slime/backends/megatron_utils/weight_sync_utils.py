@@ -63,8 +63,13 @@ def _try_reconfigure_allocator() -> bool:
     torch.cuda.empty_cache()
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:False")
-    except Exception:
-        pass
+        logger.info("_set_allocator_settings('expandable_segments:False') succeeded.")
+    except Exception as alloc_exc:
+        logger.warning(
+            "_set_allocator_settings failed: %s (type=%s). "
+            "Runtime allocator reconfiguration is not available.",
+            alloc_exc, type(alloc_exc).__name__,
+        )
 
     # 3. Re-probe with a fresh allocation.
     try:
@@ -72,7 +77,11 @@ def _try_reconfigure_allocator() -> bool:
         probe.untyped_storage()._share_cuda_()
         del probe
         return True
-    except Exception:
+    except Exception as reprobe_exc:
+        logger.error(
+            "CUDA IPC re-probe after reconfiguration also failed: %s (type=%s)",
+            reprobe_exc, type(reprobe_exc).__name__,
+        )
         return False
 
 
@@ -108,8 +117,14 @@ def check_cuda_ipc_available() -> bool:
         del probe
         _cuda_ipc_available = True
         return True
-    except Exception:
-        pass
+    except Exception as first_exc:
+        logger.warning(
+            "CUDA IPC first probe failed: %s (type=%s). "
+            "PYTORCH_CUDA_ALLOC_CONF=%s",
+            first_exc,
+            type(first_exc).__name__,
+            os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "<unset>"),
+        )
 
     # ── probe failed → attempt runtime fix ───────────────────────────
     logger.warning(
@@ -147,18 +162,43 @@ def assert_cuda_ipc_available() -> None:
     if check_cuda_ipc_available():
         return
 
+    # Collect diagnostic info for the error message
+    diag_lines = [
+        f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')}",
+    ]
+    try:
+        diag_lines.append(f"torch.version.cuda={torch.version.cuda}")
+        diag_lines.append(f"torch.__version__={torch.__version__}")
+    except Exception:
+        pass
+    try:
+        diag_lines.append(f"allocator_backend={torch.cuda.get_allocator_backend()}")
+    except Exception:
+        pass
+    # Check /dev/shm (common Docker issue)
+    try:
+        import shutil
+        shm = shutil.disk_usage("/dev/shm")
+        diag_lines.append(f"/dev/shm total={shm.total // (1024**2)}MB free={shm.free // (1024**2)}MB")
+    except Exception:
+        diag_lines.append("/dev/shm: not available (container without --ipc=host?)")
+
+    diag = "\n    ".join(diag_lines)
+
     raise RuntimeError(
         "CUDA IPC is required in colocated mode (--colocate) but is "
-        "unavailable.  This is almost always caused by "
-        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (the PyTorch "
-        "2.1+ default on Linux).  The runtime attempt to reconfigure the "
-        "allocator also failed.\n\n"
-        "To fix this, set the following environment variable *before* "
-        "launching the job:\n"
-        "    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False\n\n"
-        "If you are using Ray, add it to runtime_env env_vars.  "
-        "Current value: "
-        f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')}"
+        "unavailable.  The runtime attempt to reconfigure the allocator "
+        "also failed.\n\n"
+        "Common causes:\n"
+        "  1. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (PyTorch 2.1+ "
+        "default on Linux) — set expandable_segments:False *before* launch.\n"
+        "  2. Docker container without --ipc=host (or --shm-size too small).\n"
+        "  3. Megatron-LM or TransformerEngine overriding the allocator "
+        "settings during init (check logs above for details).\n\n"
+        "To fix:\n"
+        "    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False\n"
+        "    # If using Docker, also add: --ipc=host\n\n"
+        f"Diagnostics:\n    {diag}"
     )
 
 

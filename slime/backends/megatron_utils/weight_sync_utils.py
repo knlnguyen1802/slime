@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 import pickle
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
@@ -34,6 +35,47 @@ logger = logging.getLogger(__name__)
 _cuda_ipc_available: bool | None = None
 
 
+def _strip_expandable_segments_env() -> None:
+    """Force ``expandable_segments:False`` in ``PYTORCH_CUDA_ALLOC_CONF``.
+
+    PyTorch 2.1+ defaults ``expandable_segments`` to ``True`` on Linux even
+    when the env var is unset.  We always write an explicit ``False`` entry
+    so that any *future* CUDA context in this process (or child process)
+    will use ``cudaMalloc`` which is compatible with CUDA IPC.
+    """
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    parts = [p.strip() for p in alloc_conf.split(",") if p.strip()]
+    parts = [p for p in parts if not p.startswith("expandable_segments")]
+    parts.append("expandable_segments:False")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
+
+
+def _try_reconfigure_allocator() -> bool:
+    """Attempt to switch the CUDA caching allocator to ``expandable_segments:False``
+    at runtime, *after* a CUDA context already exists.
+
+    Returns ``True`` if a subsequent IPC probe succeeds.
+    """
+    # 1. Set env var so any new child process inherits the right setting.
+    _strip_expandable_segments_env()
+
+    # 2. Try the private runtime API (PyTorch ≥ 2.1).
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    except Exception:
+        pass
+
+    # 3. Re-probe with a fresh allocation.
+    try:
+        probe = torch.zeros(1, device="cuda")
+        probe.untyped_storage()._share_cuda_()
+        del probe
+        return True
+    except Exception:
+        return False
+
+
 def check_cuda_ipc_available() -> bool:
     """Proactively check whether CUDA IPC handles can be created.
 
@@ -42,8 +84,14 @@ def check_cuda_ipc_available() -> bool:
     Memory obtained that way is fundamentally incompatible with
     ``cudaIpcGetMemHandle``, which ``storage._share_cuda_()`` relies on.
 
-    This function allocates a tiny 1-byte probe tensor, tries to create an
-    IPC handle, and caches the result for the process lifetime.
+    On first call this function:
+
+    1. Allocates a tiny probe tensor and tries to create an IPC handle.
+    2. If the probe fails it **attempts to reconfigure** the allocator at
+       runtime (``empty_cache`` + ``_set_allocator_settings``) and re-probes.
+    3. Only falls back to CPU transfer if the reconfiguration also fails.
+
+    The result is cached for the process lifetime.
     """
     global _cuda_ipc_available
     if _cuda_ipc_available is not None:
@@ -53,19 +101,65 @@ def check_cuda_ipc_available() -> bool:
         _cuda_ipc_available = False
         return False
 
+    # ── first probe ──────────────────────────────────────────────────
     try:
         probe = torch.zeros(1, device="cuda")
         probe.untyped_storage()._share_cuda_()
+        del probe
         _cuda_ipc_available = True
+        return True
     except Exception:
-        _cuda_ipc_available = False
-        logger.warning(
-            "CUDA IPC is unavailable (commonly caused by "
-            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). "
-            "Weight sync will transfer tensors via CPU instead of "
-            "zero-copy GPU IPC."
+        pass
+
+    # ── probe failed → attempt runtime fix ───────────────────────────
+    logger.warning(
+        "CUDA IPC probe failed (commonly caused by "
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True). "
+        "Attempting to reconfigure the allocator …"
+    )
+    if _try_reconfigure_allocator():
+        logger.info(
+            "CUDA IPC is now available after disabling expandable_segments "
+            "at runtime.  Weight sync will use zero-copy GPU IPC."
         )
+        _cuda_ipc_available = True
+        return True
+
+    # ── reconfiguration also failed ──────────────────────────────────
+    _cuda_ipc_available = False
+    logger.warning(
+        "CUDA IPC is still unavailable after attempting to disable "
+        "expandable_segments.  Weight sync will transfer tensors via "
+        "CPU instead of zero-copy GPU IPC.  To fix this permanently, "
+        "set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False "
+        "*before* launching the job."
+    )
     return _cuda_ipc_available
+
+
+def assert_cuda_ipc_available() -> None:
+    """Assert that CUDA IPC is available, raising if not.
+
+    Call this early in colocated mode (after CUDA context creation) to
+    fail fast instead of silently falling back to slow CPU transfers
+    that can cause downstream vLLM crashes.
+    """
+    if check_cuda_ipc_available():
+        return
+
+    raise RuntimeError(
+        "CUDA IPC is required in colocated mode (--colocate) but is "
+        "unavailable.  This is almost always caused by "
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (the PyTorch "
+        "2.1+ default on Linux).  The runtime attempt to reconfigure the "
+        "allocator also failed.\n\n"
+        "To fix this, set the following environment variable *before* "
+        "launching the job:\n"
+        "    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False\n\n"
+        "If you are using Ray, add it to runtime_env env_vars.  "
+        "Current value: "
+        f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')}"
+    )
 
 
 # ── FlattenedTensorBucket ───────────────────────────────────────────

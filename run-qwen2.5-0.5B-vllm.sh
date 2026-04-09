@@ -115,6 +115,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
         "NCCL_ALGO": "Ring",
         "NCCL_IB_DISABLE": "1",
         "NCCL_P2P_DISABLE": "1",

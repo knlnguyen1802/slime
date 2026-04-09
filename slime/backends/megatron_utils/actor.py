@@ -53,12 +53,30 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> int | None:
         monkey_patch_torch_dist()
 
+        # Disable expandable_segments *before* any CUDA context is created
+        # (Megatron's init() below will initialise CUDA).  This ensures
+        # cudaIpcGetMemHandle works for zero-copy weight sync.
+        if getattr(args, "colocate", False):
+            from slime.backends.megatron_utils.weight_sync_utils import _strip_expandable_segments_env
+            _strip_expandable_segments_env()
+            logger.info(
+                "Stripped expandable_segments from PYTORCH_CUDA_ALLOC_CONF "
+                "in trainer process for CUDA IPC compatibility (value: %s).",
+                os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "<unset>"),
+            )
+
         super().init(args, role, with_ref, with_opd_teacher)
 
         if args.debug_rollout_only:
             return 0
 
         init(args)
+
+        # In colocated mode CUDA IPC is mandatory – fail fast rather than
+        # silently falling back to CPU transfers that crash vLLM later.
+        if getattr(args, "colocate", False):
+            from slime.backends.megatron_utils.weight_sync_utils import assert_cuda_ipc_available
+            assert_cuda_ipc_available()
 
         if is_megatron_main_rank():
             init_tracking(args, primary=False)

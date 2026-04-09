@@ -16,32 +16,7 @@ from slime.utils.misc import get_free_port
 logger = logging.getLogger(__name__)
 
 
-def _strip_expandable_segments_from_env():
-    """Remove ``expandable_segments`` from ``PYTORCH_CUDA_ALLOC_CONF`` and
-    explicitly force it to ``False``.
-
-    ``expandable_segments:True`` makes PyTorch's CUDA caching allocator use
-    ``cuMemCreate`` / ``cuMemMap`` instead of ``cudaMalloc``.  Memory obtained
-    that way is incompatible with ``cudaIpcGetMemHandle`` which is needed by
-    ``reduce_tensor()`` / ``storage._share_cuda_()``.
-
-    Since PyTorch 2.1+ defaults ``expandable_segments`` to ``True`` on Linux
-    even when the environment variable is not set, this function **always**
-    writes an explicit ``expandable_segments:False`` entry.
-
-    This function must be called **before** any CUDA context is created in the
-    process (i.e. before ``torch.cuda`` is used) to take effect.
-    """
-    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    parts = [p.strip() for p in alloc_conf.split(",") if p.strip()]
-    parts = [p for p in parts if not p.startswith("expandable_segments")]
-    parts.append("expandable_segments:False")
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
-    logger.info(
-        "Disabled expandable_segments in PYTORCH_CUDA_ALLOC_CONF for "
-        "CUDA IPC compatibility (new value: %s).",
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"],
-    )
+from slime.backends.megatron_utils.weight_sync_utils import _strip_expandable_segments_env
 
 
 class VLLMEngine(RayActor):
@@ -69,7 +44,7 @@ class VLLMEngine(RayActor):
         # reduce_tensor() in update_weights_from_tensor() can succeed.
         colocate = getattr(self.args, "colocate", False)
         if colocate:
-            _strip_expandable_segments_from_env()
+            _strip_expandable_segments_env()
 
     @property
     def sidecar_url(self) -> str:

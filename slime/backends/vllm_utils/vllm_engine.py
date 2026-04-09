@@ -17,19 +17,22 @@ logger = logging.getLogger(__name__)
 
 
 def _strip_expandable_segments_from_env():
-    """Remove ``expandable_segments`` from ``PYTORCH_CUDA_ALLOC_CONF``.
+    """Remove ``expandable_segments`` from ``PYTORCH_CUDA_ALLOC_CONF`` and
+    explicitly force it to ``False``.
 
     ``expandable_segments:True`` makes PyTorch's CUDA caching allocator use
     ``cuMemCreate`` / ``cuMemMap`` instead of ``cudaMalloc``.  Memory obtained
     that way is incompatible with ``cudaIpcGetMemHandle`` which is needed by
     ``reduce_tensor()`` / ``storage._share_cuda_()``.
 
+    Since PyTorch 2.1+ defaults ``expandable_segments`` to ``True`` on Linux
+    even when the environment variable is not set, this function **always**
+    writes an explicit ``expandable_segments:False`` entry.
+
     This function must be called **before** any CUDA context is created in the
     process (i.e. before ``torch.cuda`` is used) to take effect.
     """
     alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    if "expandable_segments" not in alloc_conf:
-        return
     parts = [p.strip() for p in alloc_conf.split(",") if p.strip()]
     parts = [p for p in parts if not p.startswith("expandable_segments")]
     parts.append("expandable_segments:False")
@@ -58,6 +61,7 @@ class VLLMEngine(RayActor):
         self._sidecar_log_file = None
         self._weight_version: int = 0
         self._ipc_initialized: bool = False
+        self._ipc_live_tensors: list = []  # kept alive for async EngineCore reads
 
         # CUDA IPC (cudaIpcGetMemHandle) is incompatible with the
         # expandable_segments allocator.  Disable it *before* any CUDA
@@ -314,6 +318,52 @@ class VLLMEngine(RayActor):
         log_tail = self._read_log_tail(30)
         logger.info("vLLM log after init_weight_transfer_engine:\n%s", log_tail)
 
+    def _ensure_cuda_ipc(self, device: str) -> None:
+        """Verify CUDA IPC works, attempting a runtime allocator fix if not.
+
+        If ``expandable_segments`` was not stripped from the env early enough
+        (e.g. because the CUDA context was already initialised by the Ray
+        worker), we try to reconfigure the allocator at runtime.
+        """
+        import torch
+
+        try:
+            probe = torch.zeros(1, device=device)
+            probe.untyped_storage()._share_cuda_()
+            del probe
+            return  # IPC works
+        except Exception:
+            pass
+
+        logger.warning(
+            "CUDA IPC probe failed in VLLMEngine – attempting to "
+            "reconfigure allocator with expandable_segments:False."
+        )
+        torch.cuda.empty_cache()
+        try:
+            # Private API; available in PyTorch ≥ 2.1
+            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+        except Exception:
+            pass
+
+        # Second probe with a fresh allocation
+        try:
+            probe = torch.zeros(1, device=device)
+            probe.untyped_storage()._share_cuda_()
+            del probe
+            logger.info("CUDA IPC now available after allocator reconfiguration.")
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "CUDA IPC is unavailable in VLLMEngine even after attempting "
+                "to disable expandable_segments.  Weight transfer to vLLM "
+                "requires cudaIpcGetMemHandle which is incompatible with the "
+                "expandable_segments allocator (cuMemCreate/cuMemMap).  "
+                "Please set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False "
+                "*before* launching the job, or ensure the VLLMEngine actor "
+                "process has no prior CUDA context."
+            ) from exc
+
     def update_weights_from_tensor(
         self,
         serialized_named_tensors: list[str],
@@ -371,6 +421,11 @@ class VLLMEngine(RayActor):
         # which avoids mis-mapping when CUDA_VISIBLE_DEVICES remaps GPUs.
         monkey_patch_torch_reductions()
 
+        # Validate that CUDA IPC actually works in this process.  If
+        # expandable_segments was not disabled early enough the allocator
+        # still uses cuMemCreate and cudaIpcGetMemHandle will fail.
+        self._ensure_cuda_ipc(device)
+
         names: list[str] = []
         dtype_names: list[str] = []
         shapes: list[list[int]] = []
@@ -401,7 +456,11 @@ class VLLMEngine(RayActor):
             }
         })
 
-        del live_tensors
+        # Keep tensors alive until the *next* weight update.  vLLM's
+        # EngineCore runs in a separate process and may read the IPC
+        # memory asynchronously after /update_weights returns.  Freeing
+        # them immediately can cause a use-after-free crash.
+        self._ipc_live_tensors = live_tensors
 
         if weight_version is not None:
             self._bump_weight_version(int(weight_version))

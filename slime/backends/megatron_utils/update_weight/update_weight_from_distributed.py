@@ -92,6 +92,9 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
             op = cmd["op"]
             if op == "broadcast":
                 for t in cmd["tensors"]:
+                    # Handle CPU tensors from the CUDA-IPC fallback path
+                    if not t.is_cuda:
+                        t = t.to(device)
                     comm.broadcast(t, src=0, stream=torch.cuda.current_stream())
                 torch.cuda.synchronize()
                 conn.send("ok")
@@ -102,12 +105,17 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
                     NCCLWeightTransferEngine,
                 )
 
+                # Move CPU tensors (from CUDA-IPC fallback) back to GPU
+                gpu_named = []
+                for name, t in cmd["named_tensors"]:
+                    gpu_named.append((name, t.to(device) if not t.is_cuda else t))
+
                 trainer_args = NCCLTrainerSendWeightsArgs(
                     group=comm,
                     packed=True,
                 )
                 NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=iter(cmd["named_tensors"]),
+                    iterator=iter(gpu_named),
                     trainer_args=trainer_args,
                 )
                 torch.cuda.synchronize()
@@ -155,16 +163,30 @@ class _NcclBridge:
 
     def broadcast_tensors(self, tensors: list[torch.Tensor]) -> None:
         """Broadcast a list of tensors (one-by-one) via the bridge subprocess."""
-        gpu_tensors = [t.contiguous() for t in tensors]
-        self._parent_conn.send({"op": "broadcast", "tensors": gpu_tensors})
+        from slime.backends.megatron_utils.weight_sync_utils import check_cuda_ipc_available
+
+        if check_cuda_ipc_available():
+            send_tensors = [t.contiguous() for t in tensors]
+        else:
+            # CUDA IPC unavailable (expandable_segments:True) – move to CPU
+            # so pickle does not attempt cudaIpcGetMemHandle.  The bridge
+            # subprocess will move them back to GPU before NCCL broadcast.
+            send_tensors = [t.detach().cpu().contiguous() for t in tensors]
+        self._parent_conn.send({"op": "broadcast", "tensors": send_tensors})
         self._wait_ok("broadcast_tensors")
 
     def send_weights_packed(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
         """Send weights using vLLM's packed broadcast protocol."""
+        from slime.backends.megatron_utils.weight_sync_utils import check_cuda_ipc_available
+
+        use_cpu = not check_cuda_ipc_available()
         gpu_pairs = []
         for name, t in named_tensors:
             data = t.data if hasattr(t, "data") else t
-            gpu_pairs.append((name, data.contiguous()))
+            if use_cpu:
+                gpu_pairs.append((name, data.detach().cpu().contiguous()))
+            else:
+                gpu_pairs.append((name, data.contiguous()))
         self._parent_conn.send({"op": "send_packed", "named_tensors": gpu_pairs})
         self._wait_ok("send_weights_packed")
 

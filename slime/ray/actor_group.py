@@ -65,6 +65,15 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
+        # In colocated mode CUDA IPC is mandatory.  expandable_segments:True
+        # (the PyTorch 2.1+ default on Linux) makes cudaIpcGetMemHandle fail.
+        # We MUST set this in runtime_env so it is present at process start,
+        # *before* any module import can trigger CUDA allocator initialisation.
+        # Setting it later inside init() is too late if megatron / torch imports
+        # already created a CUDA context.
+        if getattr(self.args, "colocate", False):
+            env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
+
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver
 

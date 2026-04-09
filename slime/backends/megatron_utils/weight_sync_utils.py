@@ -61,19 +61,23 @@ def _try_reconfigure_allocator() -> bool:
 
     # 2. Try the private runtime API (PyTorch ≥ 2.1).
     torch.cuda.empty_cache()
-    try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
-        logger.info("_set_allocator_settings('expandable_segments:False') succeeded.")
-    except Exception as alloc_exc:
-        logger.warning(
-            "_set_allocator_settings failed: %s (type=%s). "
-            "Runtime allocator reconfiguration is not available.",
-            alloc_exc, type(alloc_exc).__name__,
-        )
+    # Try the new API first (PyTorch 2.10+), then fall back to the old one.
+    for setter in [
+        lambda: torch._C._accelerator_setAllocatorSettings("expandable_segments:False"),
+        lambda: torch.cuda.memory._set_allocator_settings("expandable_segments:False"),
+    ]:
+        try:
+            setter()
+            logger.info("Allocator settings updated: expandable_segments:False")
+            break
+        except Exception:
+            pass
 
-    # 3. Re-probe with a fresh allocation.
+    # 3. Re-probe with a fresh allocation (use a larger tensor to avoid
+    #    any special small-allocation paths in the caching allocator).
+    torch.cuda.empty_cache()
     try:
-        probe = torch.zeros(1, device="cuda")
+        probe = torch.zeros(256, device="cuda")
         probe.untyped_storage()._share_cuda_()
         del probe
         return True
@@ -83,6 +87,59 @@ def _try_reconfigure_allocator() -> bool:
             reprobe_exc, type(reprobe_exc).__name__,
         )
         return False
+
+
+def _probe_raw_cuda_ipc() -> tuple[bool, str]:
+    """Probe CUDA IPC at the driver level using ctypes, bypassing PyTorch's
+    caching allocator entirely.
+
+    Returns ``(success, detail_message)``.
+    """
+    import ctypes
+
+    try:
+        libcudart = ctypes.CDLL("libcudart.so")
+    except OSError:
+        try:
+            libcudart = ctypes.CDLL("libcudart.so.12")
+        except OSError:
+            return False, "Could not load libcudart.so"
+
+    # cudaMalloc
+    ptr = ctypes.c_void_p()
+    ret = libcudart.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(1024))
+    if ret != 0:
+        return False, f"cudaMalloc failed with error code {ret}"
+
+    # cudaIpcGetMemHandle
+    handle = (ctypes.c_byte * 64)()  # cudaIpcMemHandle_t is 64 bytes
+    ret = libcudart.cudaIpcGetMemHandle(ctypes.byref(handle), ptr)
+    libcudart.cudaFree(ptr)
+
+    if ret != 0:
+        return False, f"cudaIpcGetMemHandle failed with error code {ret} (cudaMalloc ptr)"
+
+    return True, "Raw CUDA IPC works with cudaMalloc pointer"
+
+
+def _check_cuda_mps_active() -> bool:
+    """Check if CUDA MPS (Multi-Process Service) is active.
+
+    CUDA IPC (cudaIpcGetMemHandle) is NOT supported under MPS.
+    """
+    if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
+        return True
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "-q", "-d", "COMPUTE"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "MPS" in result.stdout and "Server" in result.stdout:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def check_cuda_ipc_available() -> bool:
@@ -112,7 +169,7 @@ def check_cuda_ipc_available() -> bool:
 
     # ── first probe ──────────────────────────────────────────────────
     try:
-        probe = torch.zeros(1, device="cuda")
+        probe = torch.zeros(256, device="cuda")
         probe.untyped_storage()._share_cuda_()
         del probe
         _cuda_ipc_available = True
@@ -140,7 +197,31 @@ def check_cuda_ipc_available() -> bool:
         _cuda_ipc_available = True
         return True
 
-    # ── reconfiguration also failed ──────────────────────────────────
+    # ── reconfiguration also failed → diagnose deeper ────────────────
+    # Check if this is a PyTorch allocator issue vs a CUDA/container issue
+    if _check_cuda_mps_active():
+        logger.error(
+            "CUDA MPS (Multi-Process Service) is active. "
+            "cudaIpcGetMemHandle is NOT supported under MPS. "
+            "Disable MPS to use colocated mode."
+        )
+
+    raw_ok, raw_detail = _probe_raw_cuda_ipc()
+    if raw_ok:
+        logger.warning(
+            "Raw CUDA IPC works (cudaMalloc + cudaIpcGetMemHandle) but "
+            "PyTorch's _share_cuda_() fails. This means PyTorch's caching "
+            "allocator is using a non-IPC-compatible allocation method "
+            "despite expandable_segments:False. This is likely a PyTorch "
+            "2.10+/CUDA 12.8 incompatibility."
+        )
+    else:
+        logger.error(
+            "Raw CUDA IPC also failed: %s. This is a CUDA driver or "
+            "container configuration issue, NOT a PyTorch issue.",
+            raw_detail,
+        )
+
     _cuda_ipc_available = False
     logger.warning(
         "CUDA IPC is still unavailable after attempting to disable "
@@ -182,22 +263,47 @@ def assert_cuda_ipc_available() -> None:
         diag_lines.append(f"/dev/shm total={shm.total // (1024**2)}MB free={shm.free // (1024**2)}MB")
     except Exception:
         diag_lines.append("/dev/shm: not available (container without --ipc=host?)")
+    # MPS check
+    mps_active = _check_cuda_mps_active()
+    diag_lines.append(f"CUDA MPS active={mps_active}")
+    # Raw CUDA IPC check (bypasses PyTorch allocator)
+    raw_ok, raw_detail = _probe_raw_cuda_ipc()
+    diag_lines.append(f"Raw cudaIpcGetMemHandle: {'OK' if raw_ok else 'FAILED'} ({raw_detail})")
 
     diag = "\n    ".join(diag_lines)
 
+    if raw_ok:
+        hint = (
+            "Raw CUDA IPC (cudaMalloc + cudaIpcGetMemHandle) works, but PyTorch's\n"
+            "caching allocator _share_cuda_() fails. This means PyTorch's allocator is\n"
+            "using a non-IPC-compatible allocation method internally despite\n"
+            "expandable_segments:False. This is a known issue with PyTorch 2.10+ / CUDA 12.8.\n\n"
+            "Workarounds:\n"
+            "  1. Downgrade PyTorch to 2.5.x or 2.6.x where cudaMalloc IPC works.\n"
+            "  2. Set PYTORCH_CUDA_ALLOC_CONF=backend:cudaMalloc (if supported).\n"
+            "  3. Check if CUDA MPS is running (nvidia-smi) and disable it.\n"
+        )
+    elif mps_active:
+        hint = (
+            "CUDA MPS (Multi-Process Service) is ACTIVE on this system.\n"
+            "cudaIpcGetMemHandle is NOT supported under MPS.\n"
+            "Disable MPS before running in colocated mode:\n"
+            "    echo quit | nvidia-cuda-mps-control\n"
+        )
+    else:
+        hint = (
+            "Both PyTorch and raw CUDA IPC failed. This is a CUDA driver or\n"
+            "container configuration issue.\n\n"
+            "To fix:\n"
+            "  1. If using Docker: add --ipc=host --pid=host\n"
+            "  2. Check nvidia-smi for MPS or MIG mode\n"
+            "  3. export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False\n"
+        )
+
     raise RuntimeError(
         "CUDA IPC is required in colocated mode (--colocate) but is "
-        "unavailable.  The runtime attempt to reconfigure the allocator "
-        "also failed.\n\n"
-        "Common causes:\n"
-        "  1. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (PyTorch 2.1+ "
-        "default on Linux) — set expandable_segments:False *before* launch.\n"
-        "  2. Docker container without --ipc=host (or --shm-size too small).\n"
-        "  3. Megatron-LM or TransformerEngine overriding the allocator "
-        "settings during init (check logs above for details).\n\n"
-        "To fix:\n"
-        "    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False\n"
-        "    # If using Docker, also add: --ipc=host\n\n"
+        "unavailable.\n\n"
+        f"{hint}\n"
         f"Diagnostics:\n    {diag}"
     )
 

@@ -70,7 +70,11 @@ class MegatronTrainRayActor(TrainRayActor):
         # Lock in expandable_segments:False *after* CUDA context creation
         # but *before* Megatron init, which may reconfigure the allocator.
         if getattr(args, "colocate", False):
-            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+            torch.cuda.empty_cache()
+            try:
+                torch._C._accelerator_setAllocatorSettings("expandable_segments:False")
+            except (AttributeError, RuntimeError):
+                torch.cuda.memory._set_allocator_settings("expandable_segments:False")
 
         if args.debug_rollout_only:
             return 0
@@ -89,8 +93,24 @@ class MegatronTrainRayActor(TrainRayActor):
             import slime.backends.megatron_utils.weight_sync_utils as _wsu
             _strip_expandable_segments_env()
             torch.cuda.empty_cache()
-            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
-            logger.info("Re-applied expandable_segments:False after Megatron init.")
+            for setter in [
+                lambda: torch._C._accelerator_setAllocatorSettings("expandable_segments:False"),
+                lambda: torch.cuda.memory._set_allocator_settings("expandable_segments:False"),
+            ]:
+                try:
+                    setter()
+                    logger.info("Re-applied expandable_segments:False after Megatron init.")
+                    break
+                except Exception:
+                    pass
+            torch.cuda.empty_cache()
+            logger.info(
+                "Pre-IPC-check state: allocator_backend=%s, device=%s, "
+                "PYTORCH_CUDA_ALLOC_CONF=%s",
+                torch.cuda.get_allocator_backend(),
+                torch.cuda.current_device(),
+                os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "<unset>"),
+            )
             # Reset the cached probe result so we get a fresh probe after
             # the allocator reconfiguration.
             _wsu._cuda_ipc_available = None

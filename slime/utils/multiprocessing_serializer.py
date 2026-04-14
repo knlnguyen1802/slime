@@ -314,7 +314,12 @@ def _modify_tuple(t, index: int, modifier: Callable):
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
+    # Only replace the device ordinal with a UUID for CUDA tensors.
+    # CPU tensors (e.g. moved to CPU for torch_memory_saver VMM compat)
+    # have a shorter args tuple with no device index at position 6.
+    tensor = args[0] if args else None
+    if tensor is not None and tensor.is_cuda:
+        output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
     return output_fn, output_args
 
 

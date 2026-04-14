@@ -17,6 +17,21 @@ from slime.utils.misc import get_free_port
 logger = logging.getLogger(__name__)
 
 
+def _run_sidecar_target(vllm_port, sidecar_port, model_name, weight_transfer_backend):
+    """Module-level target for the sidecar subprocess (must be picklable)."""
+    from slime.backends.vllm_utils.vllm_translation_sidecar import run_sidecar
+
+    run_sidecar(
+        vllm_host="127.0.0.1",
+        vllm_port=vllm_port,
+        sidecar_host="0.0.0.0",
+        sidecar_port=sidecar_port,
+        model_name=model_name,
+        log_level="info",
+        weight_transfer_backend=weight_transfer_backend,
+    )
+
+
 class VLLMEngine(RayActor):
     """Ray actor that runs vLLM server with same interface as SGLangEngine for weight sync."""
 
@@ -136,27 +151,24 @@ class VLLMEngine(RayActor):
 
     def _launch_sidecar(self):
         """Launch the translation sidecar as a subprocess."""
-        from slime.backends.vllm_utils.vllm_translation_sidecar import run_sidecar
-
         self._sidecar_log_file = tempfile.NamedTemporaryFile(
             prefix="vllm_sidecar_", suffix=".log", delete=False, mode="w"
         )
 
-        def _target():
-            run_sidecar(
-                vllm_host="127.0.0.1",
-                vllm_port=self.server_port,
-                sidecar_host="0.0.0.0",
-                sidecar_port=self.sidecar_port,
-                model_name=self._model_name,
-                log_level="info",
-                weight_transfer_backend=self._weight_transfer_backend,
-            )
-
         # Use "spawn" to avoid "Cannot re-initialize CUDA in forked subprocess"
         # when the parent (VLLMEngine actor) has already initialised CUDA.
+        # The target must be a module-level function so it can be pickled.
         ctx = multiprocessing.get_context("spawn")
-        self.sidecar_process = ctx.Process(target=_target, daemon=True)
+        self.sidecar_process = ctx.Process(
+            target=_run_sidecar_target,
+            args=(
+                self.server_port,
+                self.sidecar_port,
+                self._model_name,
+                self._weight_transfer_backend,
+            ),
+            daemon=True,
+        )
         self.sidecar_process.start()
         logger.info(
             "Launched translation sidecar on port %s (vLLM → %s:%s), log=%s",

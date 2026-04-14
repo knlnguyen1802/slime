@@ -153,7 +153,10 @@ class VLLMEngine(RayActor):
                 weight_transfer_backend=self._weight_transfer_backend,
             )
 
-        self.sidecar_process = multiprocessing.Process(target=_target, daemon=True)
+        # Use "spawn" to avoid "Cannot re-initialize CUDA in forked subprocess"
+        # when the parent (VLLMEngine actor) has already initialised CUDA.
+        ctx = multiprocessing.get_context("spawn")
+        self.sidecar_process = ctx.Process(target=_target, daemon=True)
         self.sidecar_process.start()
         logger.info(
             "Launched translation sidecar on port %s (vLLM → %s:%s), log=%s",

@@ -1782,6 +1782,9 @@ def slime_validate_args(args):
     if args.offload_rollout is None:
         args.offload_rollout = False
 
+    # Force offload_train to False regardless of other flags.
+    args.offload_train = False
+
     # Default vllm_weight_transfer_backend to 'nccl' if not set.
     if getattr(args, "vllm_weight_transfer_backend", None) is None:
         args.vllm_weight_transfer_backend = "nccl"

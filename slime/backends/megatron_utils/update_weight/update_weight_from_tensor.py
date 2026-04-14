@@ -20,7 +20,6 @@ from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer, monkey_pa
 # which uses a MemPool that may not produce IPC-compatible blocks.
 # When the LD_PRELOAD hook is active we must avoid CUDA IPC serialization by
 # moving tensors to CPU before pickling.
-_TMS_VMM_ACTIVE = "torch_memory_saver" in os.environ.get("LD_PRELOAD", "")
 
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
@@ -243,18 +242,6 @@ def _send_to_colocated_engine(
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         metadata = flattened_tensor_bucket.get_metadata()
         flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-
-        if _TMS_VMM_ACTIVE and flattened_tensor.is_cuda:
-            # torch_memory_saver's LD_PRELOAD replaces cudaMalloc with VMM.
-            # cudaIpcGetMemHandle cannot handle VMM pointers, so we move the
-            # tensor to CPU before serialisation.  The receiver (rollout
-            # engine process, which does NOT have LD_PRELOAD) moves it back
-            # to GPU before sending to vLLM / sglang.
-            flattened_tensor = flattened_tensor.cpu()
-        elif flattened_tensor.is_cuda:
-            # When VMM is not active, flush any async CUDA errors before
-            # the _share_cuda_() call inside ForkingPickler.
-            torch.cuda.synchronize()
 
         flattened_tensor_data = {
             "flattened_tensor": flattened_tensor,

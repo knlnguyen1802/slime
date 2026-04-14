@@ -7,7 +7,7 @@
 #   ./run-qwen2.5-0.5B-vllm.sh --colocated  # colocated (same GPU, IPC weight sync)
 
 # Parse script-level flags
-COLOCATED=false
+COLOCATED=true
 for arg in "$@"; do
     case $arg in
         --colocated) COLOCATED=true ;;

@@ -11,7 +11,7 @@ from ray.actor import ActorHandle
 
 from slime.utils.distributed_utils import get_gloo_group
 
-from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer, monkey_patch_torch_reductions
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -212,6 +212,9 @@ def _send_to_colocated_engine(
     if ipc_gather_group is None:
         return [], None
 
+    # Ensure the CUDA-IPC pickling patch is active in this process (idempotent).
+    monkey_patch_torch_reductions()
+
     # TODO improve
     long_live_tensors = []
 
@@ -229,8 +232,17 @@ def _send_to_colocated_engine(
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+
+        # Flush any asynchronous CUDA errors that may have occurred during
+        # training or weight conversion.  Without this, a stale error would
+        # surface misleadingly at the _share_cuda_() call inside
+        # ForkingPickler and be very hard to diagnose.
+        if flattened_tensor.is_cuda:
+            torch.cuda.synchronize()
+
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)

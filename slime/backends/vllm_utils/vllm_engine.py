@@ -420,6 +420,18 @@ class VLLMEngine(RayActor):
         # Uses IPCWeightTransferEngine.trainer_send_weights() which handles
         # CUDA IPC handle creation, serialization, and HTTP transport
         # internally — no manual reduce_tensor / pickle / base64 needed.
+        #
+        # IMPORTANT: The deserialized tensors above were reconstructed from
+        # CUDA IPC handles (cudaIpcOpenMemHandle).  PyTorch / CUDA forbids
+        # calling cudaIpcGetMemHandle on IPC-imported memory, so
+        # trainer_send_weights() would fail with:
+        #   "Attempted to send CUDA tensor received from another process"
+        # Cloning creates fresh allocations owned by *this* process, making
+        # them eligible for a second round of IPC export.
+        all_named_tensors = [
+            (name, tensor.clone()) for name, tensor in all_named_tensors
+        ]
+
         from vllm.distributed.weight_transfer.ipc_engine import (
             IPCTrainerSendWeightsArgs,
             IPCWeightTransferEngine,

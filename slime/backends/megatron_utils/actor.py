@@ -557,7 +557,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        with torch_memory_saver.disable(): # if self.args.offload_train else nullcontext():
+        with nullcontext():#torch_memory_saver.disable(): # if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")

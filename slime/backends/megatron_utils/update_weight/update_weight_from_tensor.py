@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -12,6 +13,15 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer, monkey_patch_torch_reductions
+
+# torch_memory_saver's LD_PRELOAD hook replaces cudaMalloc with CUDA VMM APIs
+# (cuMemAddressReserve + cuMemMap).  VMM-allocated memory is fundamentally
+# incompatible with cudaIpcGetMemHandle, even inside torch_memory_saver.disable()
+# which uses a MemPool that may not produce IPC-compatible blocks.
+# When the LD_PRELOAD hook is active we must avoid CUDA IPC serialization by
+# moving tensors to CPU before pickling.
+_TMS_VMM_ACTIVE = "torch_memory_saver" in os.environ.get("LD_PRELOAD", "")
+
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -234,11 +244,16 @@ def _send_to_colocated_engine(
         metadata = flattened_tensor_bucket.get_metadata()
         flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
 
-        # Flush any asynchronous CUDA errors that may have occurred during
-        # training or weight conversion.  Without this, a stale error would
-        # surface misleadingly at the _share_cuda_() call inside
-        # ForkingPickler and be very hard to diagnose.
-        if flattened_tensor.is_cuda:
+        if _TMS_VMM_ACTIVE and flattened_tensor.is_cuda:
+            # torch_memory_saver's LD_PRELOAD replaces cudaMalloc with VMM.
+            # cudaIpcGetMemHandle cannot handle VMM pointers, so we move the
+            # tensor to CPU before serialisation.  The receiver (rollout
+            # engine process, which does NOT have LD_PRELOAD) moves it back
+            # to GPU before sending to vLLM / sglang.
+            flattened_tensor = flattened_tensor.cpu()
+        elif flattened_tensor.is_cuda:
+            # When VMM is not active, flush any async CUDA errors before
+            # the _share_cuda_() call inside ForkingPickler.
             torch.cuda.synchronize()
 
         flattened_tensor_data = {

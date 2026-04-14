@@ -425,16 +425,25 @@ class TranslationSidecar:
         for serialized in serialized_named_tensors:
             data = MultiprocessingSerializer.deserialize(serialized)
             if load_format == "flattened_bucket":
+                # When the training actor uses torch_memory_saver's LD_PRELOAD
+                # (VMM), tensors arrive as CPU to avoid CUDA IPC
+                # incompatibility.  Move to GPU before reconstructing.
+                ft = data["flattened_tensor"]
+                if not ft.is_cuda:
+                    ft = ft.cuda()
                 bucket = FlattenedTensorBucket(
-                    flattened_tensor=data["flattened_tensor"],
+                    flattened_tensor=ft,
                     metadata=data["metadata"],
                 )
                 all_named_tensors.extend(bucket.reconstruct_tensors())
             else:
                 if isinstance(data, list):
-                    all_named_tensors.extend(data)
+                    all_named_tensors.extend(
+                        (n, t.cuda() if not t.is_cuda else t) for n, t in data
+                    )
                 else:
-                    all_named_tensors.append(data)
+                    n, t = data
+                    all_named_tensors.append((n, t.cuda() if not t.is_cuda else t))
 
         if not all_named_tensors:
             return JSONResponse(content={"status": "ok", "loaded": 0})

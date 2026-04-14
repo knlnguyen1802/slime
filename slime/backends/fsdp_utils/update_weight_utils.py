@@ -17,36 +17,44 @@ logger = logging.getLogger(__name__)
 
 
 def _import_sglang_weight_sync_utils():
-    """Lazy-import SGLang serialization utilities.
+    """Lazy-import weight-sync serialization utilities.
 
     Centralizes the try/except version fallbacks so callers get a clean tuple.
-    Falls back to local reimplementations in
-    ``slime.backends.megatron_utils.weight_sync_utils`` when sglang is not
-    installed (e.g. vLLM-only environments).
+    Prefers the standalone slime implementations, falls back to sglang when
+    available, and finally to ``slime.backends.megatron_utils.weight_sync_utils``.
     """
     # ── monkey_patch_torch_reductions ──
     try:
-        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+        from slime.utils.multiprocessing_serializer import monkey_patch_torch_reductions
     except ImportError:
         try:
-            from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
         except ImportError:
-            from slime.backends.megatron_utils.weight_sync_utils import monkey_patch_torch_reductions
+            try:
+                from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+            except ImportError:
+                from slime.backends.megatron_utils.weight_sync_utils import monkey_patch_torch_reductions
 
     # ── MultiprocessingSerializer ──
     try:
-        from sglang.srt.utils import MultiprocessingSerializer
+        from slime.utils.multiprocessing_serializer import MultiprocessingSerializer
     except ImportError:
-        from slime.backends.megatron_utils.weight_sync_utils import MultiprocessingSerializer
+        try:
+            from sglang.srt.utils import MultiprocessingSerializer
+        except ImportError:
+            from slime.backends.megatron_utils.weight_sync_utils import MultiprocessingSerializer
 
     # ── FlattenedTensorBucket ──
     try:
-        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
+        from slime.utils.multiprocessing_serializer import FlattenedTensorBucket
     except ImportError:
         try:
-            from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
+            from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
         except ImportError:
-            from slime.backends.megatron_utils.weight_sync_utils import FlattenedTensorBucket
+            try:
+                from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
+            except ImportError:
+                from slime.backends.megatron_utils.weight_sync_utils import FlattenedTensorBucket
 
     return monkey_patch_torch_reductions, MultiprocessingSerializer, FlattenedTensorBucket
 

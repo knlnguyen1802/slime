@@ -268,6 +268,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                      "Lower this if the training model leaves insufficient free memory.",
             )
             parser.add_argument(
+                "--vllm-weight-transfer-backend",
+                type=str,
+                choices=["nccl", "ipc"],
+                default=None,
+                help="vLLM weight transfer backend: 'nccl' (default for non-colocate) or "
+                     "'ipc' (default for colocate, zero-copy CUDA IPC, TP=1 only). "
+                     "Automatically set to 'ipc' when --colocate is used with --rollout-backend vllm.",
+            )
+            parser.add_argument(
                 "--rollout-server-concurrency",
                 type=int,
                 default=512,
@@ -1749,6 +1758,16 @@ def slime_validate_args(args):
             args.offload_train = True
         if args.offload_rollout is None:
             args.offload_rollout = True
+
+        # Auto-set vLLM weight transfer backend to IPC for colocated mode.
+        if getattr(args, "rollout_backend", "sglang") == "vllm":
+            if getattr(args, "vllm_weight_transfer_backend", None) is None:
+                args.vllm_weight_transfer_backend = "ipc"
+                logger.info(
+                    "Colocated vLLM mode detected: setting vllm_weight_transfer_backend='ipc'. "
+                    "Override with --vllm-weight-transfer-backend nccl if needed."
+                )
+
         if args.rollout_num_gpus != args.actor_num_gpus_per_node * args.actor_num_nodes:
             logger.info(
                 f"rollout_num_gpus {args.rollout_num_gpus} != actor_num_gpus_per_node {args.actor_num_gpus_per_node} "
@@ -1762,6 +1781,10 @@ def slime_validate_args(args):
         args.offload_train = False
     if args.offload_rollout is None:
         args.offload_rollout = False
+
+    # Default vllm_weight_transfer_backend to 'nccl' if not set.
+    if getattr(args, "vllm_weight_transfer_backend", None) is None:
+        args.vllm_weight_transfer_backend = "nccl"
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

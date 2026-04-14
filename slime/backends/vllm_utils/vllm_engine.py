@@ -1,5 +1,6 @@
 """VLLMEngine: Ray actor that launches and manages a vLLM server + translation sidecar."""
 
+import json
 import logging
 import multiprocessing
 import os
@@ -32,6 +33,10 @@ class VLLMEngine(RayActor):
         self._log_file = None
         self._sidecar_log_file = None
         self._weight_version: int = 0
+        self._weight_transfer_backend: str = kwargs.get(
+            "weight_transfer_backend",
+            getattr(args, "vllm_weight_transfer_backend", "nccl"),
+        )
 
     @property
     def sidecar_url(self) -> str:
@@ -67,7 +72,7 @@ class VLLMEngine(RayActor):
             "--tensor-parallel-size", str(tp),
             "--port", str(self.server_port),
             "--host", "0.0.0.0",
-            "--weight-transfer-config", '{"backend": "nccl"}',
+            "--weight-transfer-config", json.dumps({"backend": self._weight_transfer_backend}),
             "--seed", str(seed),
             "--trust-remote-code",
         ]
@@ -87,6 +92,8 @@ class VLLMEngine(RayActor):
         env.setdefault("NCCL_DEBUG_SUBSYS", "ALL")
         env["NCCL_P2P_DISABLE"] = "1"
         env.setdefault("NCCL_IB_DISABLE", "1")
+        if self._weight_transfer_backend == "ipc":
+            env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         self._log_file = tempfile.NamedTemporaryFile(
             prefix="vllm_engine_", suffix=".log", delete=False, mode="w"
@@ -143,6 +150,7 @@ class VLLMEngine(RayActor):
                 sidecar_port=self.sidecar_port,
                 model_name=self._model_name,
                 log_level="info",
+                weight_transfer_backend=self._weight_transfer_backend,
             )
 
         self.sidecar_process = multiprocessing.Process(target=_target, daemon=True)
@@ -249,6 +257,12 @@ class VLLMEngine(RayActor):
         pass
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name=None, backend=None):
+        if self._weight_transfer_backend == "ipc":
+            # IPC backend needs no initialisation; call with empty info for the no-op.
+            logger.info("IPC weight transfer backend – skipping NCCL group init.")
+            self._post("/init_weight_transfer_engine", json_data={"init_info": {}})
+            return
+
         logger.info(
             "Initializing NCCL weight transfer: master=%s:%s, rank_offset=%d, "
             "world_size=%d, vllm_url=http://%s:%s, vllm_log=%s",
@@ -289,6 +303,152 @@ class VLLMEngine(RayActor):
         })
         # Notify the sidecar about the new weight version
         self._bump_weight_version(weight_version)
+
+    def update_weights_from_tensor(
+        self,
+        serialized_named_tensors: list[str],
+        load_format: str | None = None,
+        flush_cache: bool = False,
+        weight_version: str | None = None,
+    ):
+        """Update model weights from tensor data via CUDA IPC handles.
+
+        Deserializes the ``FlattenedTensorBucket`` payloads (produced by
+        :class:`MultiprocessingSerializer`), re-creates CUDA IPC handles via
+        ``reduce_tensor``, and sends them to vLLM's native
+        ``POST /update_weights`` endpoint with the ``ipc`` backend.
+
+        When the weight-transfer backend is not ``ipc`` (e.g. ``nccl``), falls
+        back to the translation-sidecar safetensors path.
+
+        This mirrors the ``SGLangEngine.update_weights_from_tensor`` interface
+        so that the FSDP / Megatron weight-sync code works with either backend.
+        """
+        if self._weight_transfer_backend == "ipc":
+            return self._update_weights_ipc(
+                serialized_named_tensors, load_format, flush_cache, weight_version,
+            )
+        return self._update_weights_via_sidecar(
+            serialized_named_tensors, load_format, flush_cache, weight_version,
+        )
+
+    # ------------------------------------------------------------------
+    # IPC path – zero-copy, GPU-to-GPU via vLLM's native IPC engine
+    # ------------------------------------------------------------------
+
+    def _update_weights_ipc(
+        self,
+        serialized_named_tensors: list[str],
+        load_format: str | None,
+        flush_cache: bool,
+        weight_version: str | None,
+    ):
+        import torch
+
+        from slime.utils.multiprocessing_serializer import (
+            FlattenedTensorBucket,
+            MultiprocessingSerializer,
+            monkey_patch_torch_reductions,
+        )
+
+        monkey_patch_torch_reductions()
+
+        # ── Deserialize all tensor payloads ──────────────────────────────
+        all_named_tensors: list[tuple[str, torch.Tensor]] = []
+        for serialized in serialized_named_tensors:
+            data = MultiprocessingSerializer.deserialize(serialized)
+            if load_format == "flattened_bucket":
+                bucket = FlattenedTensorBucket(
+                    flattened_tensor=data["flattened_tensor"],
+                    metadata=data["metadata"],
+                )
+                all_named_tensors.extend(bucket.reconstruct_tensors())
+            else:
+                if isinstance(data, list):
+                    all_named_tensors.extend(data)
+                else:
+                    all_named_tensors.append(data)
+
+        if not all_named_tensors:
+            return
+
+        # ── Validate: IPC only supports TP=1 (single GPU) ───────────────
+        # trainer_send_weights assigns one GPU UUID to all tensors.
+        # With TP > 1 the gathered serialized data spans multiple GPUs,
+        # so the single-UUID assumption breaks.  Use NCCL for multi-GPU.
+        devices = {t.device for _, t in all_named_tensors}
+        if len(devices) > 1:
+            raise RuntimeError(
+                f"IPC weight transfer only supports TP=1 (single GPU), but "
+                f"deserialized tensors reside on {len(devices)} devices: "
+                f"{devices}.  Use weight_transfer_backend='nccl' for TP > 1."
+            )
+
+        # ── Set CUDA device to match the deserialized tensors ────────────
+        # trainer_send_weights calls torch.accelerator.current_device_index()
+        # internally to obtain the GPU UUID.  We must ensure the current
+        # device matches the GPU the tensors actually live on.
+        tensor_device = all_named_tensors[0][1].device
+        torch.cuda.set_device(tensor_device)
+
+        # ── Send weights via vLLM's native IPC engine ────────────────────
+        # Uses IPCWeightTransferEngine.trainer_send_weights() which handles
+        # CUDA IPC handle creation, serialization, and HTTP transport
+        # internally — no manual reduce_tensor / pickle / base64 needed.
+        from vllm.distributed.weight_transfer.ipc_engine import (
+            IPCTrainerSendWeightsArgs,
+            IPCWeightTransferEngine,
+        )
+
+        vllm_url = f"http://{self.server_host}:{self.server_port}"
+        trainer_args = IPCTrainerSendWeightsArgs(mode="http", url=vllm_url)
+
+        logger.info(
+            "update_weights_from_tensor (IPC): sending %d params to vLLM at %s "
+            "(device=%s)",
+            len(all_named_tensors), vllm_url, tensor_device,
+        )
+        IPCWeightTransferEngine.trainer_send_weights(
+            iterator=iter(all_named_tensors),
+            trainer_args=trainer_args,
+        )
+
+        self._bump_weight_version(weight_version)
+
+        if flush_cache:
+            self.flush_cache()
+
+    # ------------------------------------------------------------------
+    # Sidecar fallback – safetensors via translation sidecar
+    # ------------------------------------------------------------------
+
+    def _update_weights_via_sidecar(
+        self,
+        serialized_named_tensors: list[str],
+        load_format: str | None,
+        flush_cache: bool,
+        weight_version: str | None,
+    ):
+        payload = {
+            "serialized_named_tensors": serialized_named_tensors,
+            "load_format": load_format,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+
+        url = f"{self.sidecar_url}/update_weights_from_tensor"
+        response = requests.post(url, json=payload, timeout=300)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            body = response.text[:2000] if response.text else "(empty)"
+            logger.error(
+                "sidecar /update_weights_from_tensor returned %s: %s",
+                response.status_code, body,
+            )
+            raise
+        return response.json()
 
     def continue_generation(self):
         self._post("/resume")

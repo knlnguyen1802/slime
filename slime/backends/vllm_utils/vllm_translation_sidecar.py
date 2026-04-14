@@ -163,10 +163,12 @@ class TranslationSidecar:
         *,
         timeout: float = 600.0,
         max_connections: int = 256,
+        weight_transfer_backend: str = "nccl",
     ):
         self.vllm_base_url = vllm_base_url.rstrip("/")
         self.model_name = model_name
         self._weight_version: int = 0
+        self._weight_transfer_backend = weight_transfer_backend
         self._active_connections: set[httpx.Response] = set()
         self._lock = asyncio.Lock()
 
@@ -211,6 +213,7 @@ class TranslationSidecar:
         app.get("/flush_cache")(self.flush_cache)
         app.get("/get_weight_version")(self.get_weight_version)
         app.post("/set_weight_version")(self.set_weight_version)
+        app.post("/update_weights_from_tensor")(self.update_weights_from_tensor)
 
         return app
 
@@ -384,6 +387,233 @@ class TranslationSidecar:
         """Return the sidecar-tracked weight version counter."""
         return JSONResponse(content={"weight_version": self._weight_version})
 
+    async def update_weights_from_tensor(self, request: Request):
+        """Receive serialized CUDA IPC tensor handles, reconstruct weights, and
+        load them into the vLLM backend.
+
+        This mirrors the SGLang ``/update_weights_from_tensor`` endpoint so that
+        the FSDP / Megatron ``UpdateWeightFromTensor`` codepath works with vLLM.
+
+        **IPC path** (``weight_transfer_backend == "ipc"``):
+        Deserializes GPU tensors → creates CUDA IPC handles via
+        ``reduce_tensor`` → sends to vLLM ``POST /update_weights`` with
+        ``ipc_handles_pickled``.  Zero-copy, no temp files, no CPU round-trip.
+
+        **Safetensors fallback** (any other backend):
+        Saves tensors to a temp ``.safetensors`` file and calls
+        ``POST /load_weights``.
+        """
+        import torch
+
+        from slime.utils.multiprocessing_serializer import (
+            FlattenedTensorBucket,
+            MultiprocessingSerializer,
+            monkey_patch_torch_reductions,
+        )
+
+        body = await request.json()
+        serialized_named_tensors: list[str] = body["serialized_named_tensors"]
+        load_format: str | None = body.get("load_format")
+        flush_cache: bool = body.get("flush_cache", False)
+        weight_version: str | None = body.get("weight_version")
+
+        # Ensure CUDA IPC handles use device UUIDs for correct cross-process mapping.
+        monkey_patch_torch_reductions()
+
+        # ── Deserialize all tensor payloads ──────────────────────────────
+        all_named_tensors: list[tuple[str, torch.Tensor]] = []
+        for serialized in serialized_named_tensors:
+            data = MultiprocessingSerializer.deserialize(serialized)
+            if load_format == "flattened_bucket":
+                bucket = FlattenedTensorBucket(
+                    flattened_tensor=data["flattened_tensor"],
+                    metadata=data["metadata"],
+                )
+                all_named_tensors.extend(bucket.reconstruct_tensors())
+            else:
+                if isinstance(data, list):
+                    all_named_tensors.extend(data)
+                else:
+                    all_named_tensors.append(data)
+
+        if not all_named_tensors:
+            return JSONResponse(content={"status": "ok", "loaded": 0})
+
+        # ── Dispatch to IPC or safetensors path ──────────────────────────
+        if self._weight_transfer_backend == "ipc":
+            result = await self._load_weights_ipc(all_named_tensors)
+        else:
+            result = await self._load_weights_safetensors(all_named_tensors)
+
+        if result is not None:
+            return result  # error response
+
+        # ── Optionally flush the KV cache ────────────────────────────────
+        if flush_cache:
+            try:
+                await self._client.post(
+                    f"{self.vllm_base_url}/sleep",
+                    params={"level": "1", "mode": "abort"},
+                    timeout=30.0,
+                )
+                await self._client.post(
+                    f"{self.vllm_base_url}/wake_up",
+                    params={"tags": "kv_cache"},
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                logger.warning("flush_cache after weight update failed: %s", exc)
+
+        # ── Bump weight version ──────────────────────────────────────────
+        if weight_version is not None:
+            self._weight_version = int(weight_version)
+        else:
+            self._weight_version += 1
+
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "loaded": len(serialized_named_tensors),
+                "weight_version": self._weight_version,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # IPC path – zero-copy GPU-to-GPU via vLLM's native IPC engine
+    # ------------------------------------------------------------------
+
+    async def _load_weights_ipc(
+        self,
+        named_tensors: list[tuple[str, "torch.Tensor"]],
+    ) -> JSONResponse | None:
+        """Send tensors to vLLM via CUDA IPC handles using vLLM's native
+        ``IPCWeightTransferEngine``.  Returns *None* on success, or a
+        ``JSONResponse`` on error."""
+        import asyncio
+
+        import torch
+
+        from vllm.distributed.weight_transfer.ipc_engine import (
+            IPCTrainerSendWeightsArgs,
+            IPCWeightTransferEngine,
+        )
+
+        # IPC only supports single-GPU (TP=1).
+        devices = {t.device for _, t in named_tensors}
+        if len(devices) > 1:
+            return JSONResponse(
+                content={
+                    "status": "error",
+                    "detail": (
+                        f"IPC weight transfer only supports TP=1, but tensors "
+                        f"reside on {len(devices)} devices: {devices}. "
+                        f"Use weight_transfer_backend='nccl' for TP > 1."
+                    ),
+                },
+                status_code=400,
+            )
+
+        # trainer_send_weights uses torch.accelerator.current_device_index()
+        # to obtain the GPU UUID — set the current device to match.
+        tensor_device = named_tensors[0][1].device
+        torch.cuda.set_device(tensor_device)
+
+        trainer_args = IPCTrainerSendWeightsArgs(
+            mode="http", url=self.vllm_base_url,
+        )
+
+        logger.info(
+            "update_weights_from_tensor (IPC): sending %d params to vLLM at %s "
+            "(device=%s)",
+            len(named_tensors), self.vllm_base_url, tensor_device,
+        )
+        try:
+            # trainer_send_weights is synchronous (uses requests internally),
+            # so run in a thread to avoid blocking the async event loop.
+            await asyncio.to_thread(
+                IPCWeightTransferEngine.trainer_send_weights,
+                iterator=iter(named_tensors),
+                trainer_args=trainer_args,
+            )
+        except Exception as exc:
+            logger.error("IPC weight update failed: %s", exc, exc_info=True)
+            return JSONResponse(
+                content={"status": "error", "detail": str(exc)},
+                status_code=500,
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    # Safetensors fallback – temp file via /load_weights
+    # ------------------------------------------------------------------
+
+    async def _load_weights_safetensors(
+        self,
+        named_tensors: list[tuple[str, "torch.Tensor"]],
+    ) -> JSONResponse | None:
+        """Save tensors to a temp safetensors file and load via vLLM
+        ``POST /load_weights``.  Returns *None* on success, or a
+        ``JSONResponse`` on error."""
+        import os
+        import tempfile
+
+        try:
+            from safetensors.torch import save_file as _st_save
+        except ImportError:
+            logger.error(
+                "safetensors is required for the safetensors weight-load fallback. "
+                "Install it with: pip install safetensors"
+            )
+            return JSONResponse(
+                content={"status": "error", "detail": "safetensors not installed"},
+                status_code=500,
+            )
+
+        tensor_dict = {name: t.contiguous().cpu() for name, t in named_tensors}
+
+        # Prefer /dev/shm (RAM-backed tmpfs) to avoid real disk I/O.
+        tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+        tmp_fd = tempfile.NamedTemporaryFile(
+            prefix="slime_weights_", suffix=".safetensors",
+            dir=tmp_dir, delete=False,
+        )
+        tmp_path = tmp_fd.name
+        tmp_fd.close()
+
+        try:
+            _st_save(tensor_dict, tmp_path)
+
+            resp = await self._client.post(
+                f"{self.vllm_base_url}/load_weights",
+                json={"files": [tmp_path]},
+                timeout=300.0,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "vLLM /load_weights returned %s: %s",
+                exc.response.status_code,
+                exc.response.text[:2000],
+            )
+            return JSONResponse(
+                content={"status": "error", "detail": str(exc)},
+                status_code=502,
+            )
+        except Exception as exc:
+            logger.error("Failed to load weights into vLLM: %s", exc, exc_info=True)
+            return JSONResponse(
+                content={"status": "error", "detail": str(exc)},
+                status_code=500,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            del tensor_dict
+
+        return None
+
     async def set_weight_version(self, request: Request):
         """Increment or set the weight version (called by VLLMEngine after weight update)."""
         body = await request.json()
@@ -408,6 +638,7 @@ def run_sidecar(
     timeout: float = 600.0,
     max_connections: int = 256,
     log_level: str = "info",
+    weight_transfer_backend: str = "nccl",
 ):
     """Launch the translation sidecar as a standalone uvicorn process."""
 
@@ -417,6 +648,7 @@ def run_sidecar(
         model_name=model_name,
         timeout=timeout,
         max_connections=max_connections,
+        weight_transfer_backend=weight_transfer_backend,
     )
     uvicorn.run(
         sidecar.app,
@@ -436,6 +668,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-connections", type=int, default=256)
     parser.add_argument("--log-level", type=str, default="info")
+    parser.add_argument("--weight-transfer-backend", type=str, default="nccl",
+                        choices=["nccl", "ipc"], help="vLLM weight transfer backend")
     args = parser.parse_args()
 
     run_sidecar(
@@ -447,6 +681,7 @@ def main():
         timeout=args.timeout,
         max_connections=args.max_connections,
         log_level=args.log_level,
+        weight_transfer_backend=args.weight_transfer_backend,
     )
 
 

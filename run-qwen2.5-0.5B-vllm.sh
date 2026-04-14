@@ -1,6 +1,18 @@
 #!/bin/bash
 # vLLM rollout backend validation script (Phase 1)
 # Based on run-qwen2.5-0.5B-reproducibility.sh
+#
+# Usage:
+#   ./run-qwen2.5-0.5B-vllm.sh              # non-colocated (separate GPUs)
+#   ./run-qwen2.5-0.5B-vllm.sh --colocated  # colocated (same GPU, IPC weight sync)
+
+# Parse script-level flags
+COLOCATED=false
+for arg in "$@"; do
+    case $arg in
+        --colocated) COLOCATED=true ;;
+    esac
+done
 
 # for rerun the task
 pkill -9 vllm
@@ -99,6 +111,19 @@ VLLM_ARGS=(
    --slime-router-middleware-paths slime.router.middleware_hub.radix_tree_middleware.RadixTreeMiddleware
 )
 
+# Adjust for colocated mode: same GPU for training + inference
+COLOCATE_ARGS=()
+if [ "$COLOCATED" = true ]; then
+    COLOCATE_ARGS=(
+        --colocate
+        --vllm-weight-transfer-backend ipc
+        --vllm-gpu-memory-utilization 0.5
+    )
+    echo "==> Colocated mode: IPC weight sync, shared GPU"
+else
+    echo "==> Non-colocated mode: NCCL weight sync, separate GPUs"
+fi
+
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
@@ -108,7 +133,16 @@ MISC_ARGS=(
    --deterministic-mode
 )
 
-ray start --head --node-ip-address 127.0.0.1 --num-gpus 2 --disable-usage-stats
+# Determine GPU count based on mode
+if [ "$COLOCATED" = true ]; then
+    NUM_GPUS=1
+    NUM_ROLLOUT_GPUS=1
+else
+    NUM_GPUS=2
+    NUM_ROLLOUT_GPUS=1
+fi
+
+ray start --head --node-ip-address 127.0.0.1 --num-gpus $NUM_GPUS --disable-usage-stats
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
@@ -128,8 +162,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 1 \
-   --num-gpus-per-node 2 \
-   --rollout-num-gpus 1 \
+   --num-gpus-per-node $NUM_GPUS \
+   --rollout-num-gpus $NUM_ROLLOUT_GPUS \
    --calculate-per-token-loss \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
@@ -140,4 +174,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${VLLM_ARGS[@]} \
+   ${COLOCATE_ARGS[@]} \
    ${MISC_ARGS[@]}

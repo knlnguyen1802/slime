@@ -261,7 +261,9 @@ def _send_to_colocated_engine(
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        serialized_tensors.append(MultiprocessingSerializer.serialize(
+            flattened_tensor_data, output_str=True, inline_cpu=not flattened_tensor.is_cuda,
+        ))
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None

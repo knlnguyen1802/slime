@@ -262,14 +262,24 @@ class MultiprocessingSerializer:
     """
 
     @staticmethod
-    def serialize(obj, output_str: bool = False):
+    def serialize(obj, output_str: bool = False, inline_cpu: bool = False):
         """Serialize *obj* (e.g. a dict containing CUDA tensors).
 
         When *output_str* is ``True`` the result is a base64-encoded UTF-8
         string suitable for JSON transport.
+
+        When *inline_cpu* is ``True``, regular ``pickle.Pickler`` is used
+        instead of ``ForkingPickler``.  This stores CPU tensor data inline
+        as raw bytes in the pickle stream, avoiding the fd-sharing path
+        (``rebuild_storage_fd`` / ``resource_sharer``) that requires a
+        matching ``authkey`` and therefore fails across different Ray actor
+        processes.
         """
         buf = io.BytesIO()
-        ForkingPickler(buf).dump(obj)
+        if inline_cpu:
+            pickle.Pickler(buf).dump(obj)
+        else:
+            ForkingPickler(buf).dump(obj)
         buf.seek(0)
         output = buf.read()
         if output_str:

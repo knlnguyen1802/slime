@@ -13,10 +13,13 @@ import ray
 import torch
 import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from slime.backends.sglang_utils.sglang_engine import SGLangEngine
-from slime.backends.vllm_utils.vllm_engine import VLLMEngine
+# GPU memory-tag constants (originally from sglang.srt.constants).
+# Duplicated here to avoid a hard sglang dependency when running the vLLM backend.
+GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+GPU_MEMORY_TYPE_WEIGHTS = "weights"
+GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
@@ -234,7 +237,14 @@ class EngineGroup:
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        if getattr(self.args, "rollout_backend", "sglang") == "vllm":
+            from slime.backends.vllm_utils.vllm_engine import VLLMEngine
+
+            RolloutRayActor = ray.remote(VLLMEngine)
+        else:
+            from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+
+            RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -967,14 +977,14 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     ``force_new`` is False, skip launching and return the existing values.
     When ``force_new`` is True (multi-model), always allocate a fresh port.
     """
-    if not force_new and args.sglang_router_ip is not None:
+    if not force_new and getattr(args, "sglang_router_ip", None) is not None:
         return args.sglang_router_ip, args.sglang_router_port
 
     router_ip = _wrap_ipv6(get_host_info()[1])
     if force_new:
         router_port = find_available_port(random.randint(3000, 4000))
     else:
-        router_port = args.sglang_router_port
+        router_port = getattr(args, "sglang_router_port", None)
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
 
@@ -989,7 +999,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_args.sglang_router_port = router_port
 
     else:
-        from sglang_router.launch_router import RouterArgs
+        from sglang_router.launch_router import RouterArgs  # noqa: delayed import — only needed for sglang router
 
         from slime.utils.http_utils import run_router
 
@@ -1045,6 +1055,9 @@ def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         router_port = None
 
     env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST}
+
+    from slime.backends.vllm_utils.vllm_engine import VLLMEngine
+
     VLLMRayActor = ray.remote(VLLMEngine)
 
     engines = []

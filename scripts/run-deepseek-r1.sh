@@ -126,7 +126,7 @@ SGLANG_ARGS=(
    --sglang-deepep-mode auto
 
    # make every dp rank has 128 concurrency
-   --sglang-server-concurrency 1024
+   --rollout-server-concurrency 1024
 )
 
 MISC_ARGS=(

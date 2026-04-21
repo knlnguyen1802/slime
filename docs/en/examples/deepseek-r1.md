@@ -171,7 +171,7 @@ OPTIMIZER_ARGS=(
 
 These are the parameters required by sglang. Here, `--rollout-num-gpus-per-engine` basically corresponds to sglang's `tp_size`. Other sglang parameters are passed to slime by adding a `--sglang-` prefix. To fully leverage sglang's large EP inference capabilities, we have added configurations like ep64, dp\_attention dp8, and deepep mode auto.
 
-The final `--sglang-server-concurrency` is a parameter specific to slime. It is used to prevent the sglang server's concurrent requests from becoming too large and crashing the HTTP server. The default is 512. However, since we now have one server for 8 nodes, we have adjusted it to 1024 to ensure that each dp rank can have a concurrency of 128.
+The final `--rollout-server-concurrency` is a parameter specific to slime. It is used to prevent the sglang server's concurrent requests from becoming too large and crashing the HTTP server. The default is 512. However, since we now have one server for 8 nodes, we have adjusted it to 1024 to ensure that each dp rank can have a concurrency of 128.
 
 ```bash
 SGLANG_ARGS=(
@@ -190,7 +190,7 @@ SGLANG_ARGS=(
    --sglang-deepep-mode auto
 
    # make every dp rank have 128 concurrency
-   --sglang-server-concurrency 1024
+   --rollout-server-concurrency 1024
 )
 ```
 

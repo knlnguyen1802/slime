@@ -45,7 +45,7 @@ class SlimeRouter:
         max_connections = getattr(args, "slime_router_max_connections", None)
         if max_connections is None:
             max_connections = (
-                args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+                args.rollout_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
             )
 
         timeout = getattr(args, "slime_router_timeout", None)

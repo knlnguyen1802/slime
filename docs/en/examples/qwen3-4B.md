@@ -280,10 +280,10 @@ In this case, 2 GPUs will be allocated for training, and 6 GPUs will be allocate
 
 ⚠️  If the concurrency on each sglang server is too high, it may exceed sglang's default CUDA graph concurrency limit (the default maximum is 160), which will affect inference speed. You can adjust this in the following two ways:
 
-1.  Use `--sglang-server-concurrency` to limit the maximum number of concurrent requests sent to a single sglang server. For example:
+1.  Use `--rollout-server-concurrency` to limit the maximum number of concurrent requests sent to a single sglang server. For example:
 
     ```bash
-    --sglang-server-concurrency 160
+    --rollout-server-concurrency 160
     ```
 
 2.  Use `--sglang-cuda-graph-bs` (which corresponds to sglang's native `--cuda-graph-bs` argument) to increase the number of CUDA graphs initialized by sglang. For example:

@@ -20,7 +20,7 @@ def get_global_worker(args, data_buffer):
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
             print("Creating new global async worker...")
-            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.sglang_server_concurrency)
+            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.rollout_server_concurrency)
             _global_worker.start()
         return _global_worker
 

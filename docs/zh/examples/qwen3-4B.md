@@ -280,10 +280,10 @@ ray job submit ... \
 
 ⚠️  在进行训推分离的时候，每个 sglang server 上的并发度太大，超过了 sglang 默认的 cuda graph 的并发度（默认最大 160），影响推理速度。可以用以下 2 种方式进行调整：
 
-1. 通过 `--sglang-server-concurrency` 限制发给一个 sglang server 的最大并发量，例如：
+1. 通过 `--rollout-server-concurrency` 限制发给一个 sglang server 的最大并发量，例如：
 
    ```bash
-   --sglang-server-concurrency 160
+   --rollout-server-concurrency 160
     ```
 
 2. 使用 `--sglang-cuda-graph-bs`，即 sglang 原生的 `--cuda-graph-bs`, 增大 sglang 初始化的 cuda graph 数量，例如：

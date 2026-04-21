@@ -10,23 +10,45 @@ import torch.distributed as dist
 from ray.actor import ActorHandle
 from torch.distributed.tensor import DTensor, Replicate
 
-try:
-    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-except ImportError:
-    from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-
-from sglang.srt.utils import MultiprocessingSerializer
-
 from slime.utils.distributed_utils import init_process_group
 
 
-try:
-    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
-except ImportError:
-    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
-
-
 logger = logging.getLogger(__name__)
+
+
+def _import_sglang_weight_sync_utils():
+    """Lazy-import SGLang serialization utilities.
+
+    Centralizes the try/except version fallbacks so callers get a clean tuple.
+    Falls back to local reimplementations in
+    ``slime.backends.megatron_utils.weight_sync_utils`` when sglang is not
+    installed (e.g. vLLM-only environments).
+    """
+    # ── monkey_patch_torch_reductions ──
+    try:
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+    except ImportError:
+        try:
+            from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+        except ImportError:
+            from slime.backends.megatron_utils.weight_sync_utils import monkey_patch_torch_reductions
+
+    # ── MultiprocessingSerializer ──
+    try:
+        from sglang.srt.utils import MultiprocessingSerializer
+    except ImportError:
+        from slime.backends.megatron_utils.weight_sync_utils import MultiprocessingSerializer
+
+    # ── FlattenedTensorBucket ──
+    try:
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
+    except ImportError:
+        try:
+            from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
+        except ImportError:
+            from slime.backends.megatron_utils.weight_sync_utils import FlattenedTensorBucket
+
+    return monkey_patch_torch_reductions, MultiprocessingSerializer, FlattenedTensorBucket
 
 
 class UpdateWeight(abc.ABC):
@@ -134,6 +156,10 @@ class UpdateWeightFromTensor(UpdateWeight):
         # gather_object is only collective among group members, so we skip entirely.
         if self._ipc_gather_group is None:
             return
+
+        monkey_patch_torch_reductions, MultiprocessingSerializer, FlattenedTensorBucket = (
+            _import_sglang_weight_sync_utils()
+        )
 
         monkey_patch_torch_reductions()
         # Use flattened bucket approach similar to Megatron

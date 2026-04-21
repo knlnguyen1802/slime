@@ -171,7 +171,7 @@ OPTIMIZER_ARGS=(
 
 sglang 所需的参数，这里 `--rollout-num-gpus-per-engine` 基本对应 sglang 的 `tp_size`，除此之外的 sglang 参数均通过添加 `--sglang-` 的前缀来传给 slime。为了充分利用 sglang 的大 EP 推理能力，我们加上了 ep64、dp_attention dp8、deepep mode auto 等配置。
 
-最后的 `--sglang-server-concurrency` 是 slime 的特有参数，是为了方式同时发给 sglang server 的并发太大打爆 http server，默认为 512。但是我们现在是 8 机一个 server，为了保证每个 dp rank 能有 128 的并发，我们调整为 1024。
+最后的 `--rollout-server-concurrency` 是 slime 的特有参数，是为了方式同时发给 sglang server 的并发太大打爆 http server，默认为 512。但是我们现在是 8 机一个 server，为了保证每个 dp rank 能有 128 的并发，我们调整为 1024。
 
 ```bash
 SGLANG_ARGS=(
@@ -190,7 +190,7 @@ SGLANG_ARGS=(
    --sglang-deepep-mode auto
 
    # make every dp rank has 128 concurrency
-   --sglang-server-concurrency 1024
+   --rollout-server-concurrency 1024
 )
 ```
 

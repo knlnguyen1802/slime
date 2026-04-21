@@ -83,13 +83,17 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
 
             elif op == "send_packed":
                 from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLTrainerSendWeightsArgs,
                     NCCLWeightTransferEngine,
                 )
 
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=iter(cmd["named_tensors"]),
+                trainer_args = NCCLTrainerSendWeightsArgs(
                     group=comm,
                     packed=True,
+                )
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iterator=iter(cmd["named_tensors"]),
+                    trainer_args=trainer_args,
                 )
                 torch.cuda.synchronize()
                 conn.send("ok")

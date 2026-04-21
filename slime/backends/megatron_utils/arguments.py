@@ -50,6 +50,12 @@ def _hf_validate_args(args, hf_config):
         ("rope_theta", "rotary_base", equal),
     ]:
         if hasattr(hf_config, hf_config_name):
+            if not hasattr(args, megatron_config_name):
+                logger.warning(
+                    f"Megatron args missing '{megatron_config_name}' (mapped from HF '{hf_config_name}') , "
+                    f"Skip validate"
+                )
+                continue
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "

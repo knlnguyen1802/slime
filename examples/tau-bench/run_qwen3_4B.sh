@@ -100,7 +100,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.7
    # If gemini API reports concurrency limit error, set this parameter to reduce the concurrency
-   # --sglang-server-concurrency 32
+   # --rollout-server-concurrency 32
 )
 
 MISC_ARGS=(

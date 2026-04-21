@@ -209,12 +209,16 @@ def get_model_provider_func(
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
         sig = inspect.signature(original_provider)
+        call_kwargs = {"pre_process": pre_process, "post_process": post_process}
         if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
+            call_kwargs["vp_stage"] = vp_stage
+        # Forward any extra kwargs (e.g. config) accepted by the provider
+        for k, v in kwargs.items():
+            if k in sig.parameters:
+                call_kwargs[k] = v
+        model = original_provider(**call_kwargs)
 
         freeze_model_params(model, args)
 

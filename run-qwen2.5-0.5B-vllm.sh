@@ -94,7 +94,7 @@ WANDB_ARGS=(
 VLLM_ARGS=(
    --rollout-backend vllm
    --rollout-num-gpus-per-engine 1
-   --sglang-server-concurrency 512
+   --rollout-server-concurrency 512
    --use-slime-router
    --slime-router-middleware-paths slime.router.middleware_hub.radix_tree_middleware.RadixTreeMiddleware
 )

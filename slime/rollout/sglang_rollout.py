@@ -76,7 +76,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
         self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+            args.rollout_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,

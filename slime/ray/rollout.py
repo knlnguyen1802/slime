@@ -596,7 +596,7 @@ class RolloutManager:
         # side unchanged, we load everything here and make ``onload_kv`` a
         # no-op for the vLLM backend.
         if self.rollout_backend == "vllm":
-            self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+            self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE])
         else:
             self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 

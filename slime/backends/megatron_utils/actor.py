@@ -344,6 +344,62 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 
+    @torch.no_grad()
+    def _log_weight_fingerprint(self, stage: str, max_params: int = 3) -> None:
+        """Log sum/norm of the first few LIVE GPU model params so we can tell
+        whether train() actually mutated the weights across rollout iterations.
+        """
+        if not is_megatron_main_rank():
+            return
+        try:
+            it = named_params_and_buffers(
+                self.args,
+                self.model,
+                convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                translate_gpu_to_cpu=False,
+            )
+            shown = 0
+            for name, p in it:
+                if not isinstance(p, torch.Tensor) or not p.is_floating_point():
+                    continue
+                t = p.detach().float()
+                logger.info(
+                    f"[WEIGHT_FP][{stage}] live_gpu name={name} "
+                    f"shape={tuple(p.shape)} sum={t.sum().item():.6f} "
+                    f"norm={t.norm().item():.6f} mean={t.mean().item():.6e}"
+                )
+                shown += 1
+                if shown >= max_params:
+                    break
+        except Exception as e:  # noqa: BLE001 - diagnostic only
+            logger.warning(f"[WEIGHT_FP][{stage}] fingerprint failed: {e}")
+
+    @torch.no_grad()
+    def _log_backup_fingerprint(self, tag: str, stage: str, max_params: int = 3) -> None:
+        """Log sum/norm of the first few tensors in the CPU backup snapshot for
+        ``tag``. This is what ``update_weights`` will push to rollout engines.
+        """
+        if not is_megatron_main_rank():
+            return
+        try:
+            snap = self.weights_backuper.get(tag)
+            shown = 0
+            for name, p in (snap.items() if hasattr(snap, "items") else snap):
+                if not isinstance(p, torch.Tensor) or not p.is_floating_point():
+                    continue
+                t = p.detach().float()
+                logger.info(
+                    f"[WEIGHT_FP][{stage}] backup[{tag}] name={name} "
+                    f"shape={tuple(p.shape)} device={p.device} "
+                    f"sum={t.sum().item():.6f} norm={t.norm().item():.6f} "
+                    f"mean={t.mean().item():.6e}"
+                )
+                shown += 1
+                if shown >= max_params:
+                    break
+        except Exception as e:  # noqa: BLE001 - diagnostic only
+            logger.warning(f"[WEIGHT_FP][{stage}] backup fingerprint failed: {e}")
+
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
             raise ValueError(
@@ -555,6 +611,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_data,
             )
 
+            # [DEBUG] fingerprint of live model weights BEFORE training step
+            self._log_weight_fingerprint(f"pre_train rollout_id={rollout_id}")
+
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -568,6 +627,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                 )
 
+            # [DEBUG] fingerprint of live model weights AFTER training step
+            self._log_weight_fingerprint(f"post_train rollout_id={rollout_id}")
+
             self.prof.step(rollout_id=rollout_id)
 
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
@@ -577,6 +639,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # update the cpu actor weight to the latest model
         self.weights_backuper.backup("actor")
+
+        # [DEBUG] fingerprint of CPU-backed "actor" snapshot that will be pushed to rollout engine
+        self._log_backup_fingerprint("actor", f"post_backup rollout_id={rollout_id}")
 
         # Update ref model if needed
         if (
